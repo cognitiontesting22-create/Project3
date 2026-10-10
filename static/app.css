@@ -1,0 +1,73 @@
+/* ticketpunch — custom styles layered on top of Tailwind */
+
+.seat {
+  width: 1.15rem;
+  height: 1.15rem;
+  flex-shrink: 0;
+  border-radius: 0.25rem 0.25rem 0.5rem 0.5rem;
+  transition: transform 0.12s ease, background-color 0.12s ease, box-shadow 0.12s ease;
+}
+.seat-available {
+  background: #3f3f46;
+}
+.seat-available:hover {
+  background: #34d399;
+  transform: scale(1.35);
+  box-shadow: 0 0 10px rgba(52, 211, 153, 0.5);
+}
+.seat-selected {
+  background: #fbbf24;
+  box-shadow: 0 0 10px rgba(251, 191, 36, 0.5);
+}
+.seat-selected:hover {
+  background: #f87171;
+  transform: scale(1.35);
+}
+.seat-sold {
+  background: #27272a;
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+.seat-demo {
+  display: inline-block;
+  pointer-events: none;
+}
+
+/* htmx indicators: show spinner while request in flight */
+.htmx-indicator {
+  display: none;
+}
+.htmx-request .htmx-indicator {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+.htmx-request .htmx-indicator-inverse {
+  display: none;
+}
+
+/* ticket stub perforation notches */
+.ticket {
+  position: relative;
+}
+.ticket-stub::before,
+.ticket-stub::after {
+  content: "";
+  position: absolute;
+  left: -0.625rem;
+  width: 1.25rem;
+  height: 1.25rem;
+  border-radius: 9999px;
+  background: #09090b;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+.ticket-stub::before {
+  top: -0.625rem;
+}
+.ticket-stub::after {
+  bottom: -0.625rem;
+}
+
+::selection {
+  background: rgba(217, 70, 239, 0.4);
+}

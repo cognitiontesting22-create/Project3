@@ -1,0 +1,67 @@
+{{define "order.html"}}
+{{template "head" "Your tickets"}}
+{{template "nav" .}}
+
+<main class="mx-auto max-w-4xl px-6 py-14">
+  <div class="flex items-start gap-4">
+    <div class="grid h-12 w-12 shrink-0 place-items-center rounded-full bg-emerald-500/15 text-emerald-400">
+      <svg class="h-6 w-6" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
+    </div>
+    <div>
+      {{if eq .Order.Status "refunded"}}
+      <h1 class="text-3xl font-black tracking-tight">Order refunded.</h1>
+      <p class="mt-1 text-zinc-400">Order <span class="font-mono text-zinc-300">#TP-{{.Order.ID}}</span> · {{money .Order.TotalCents}} returned to your card · seats released back to sale</p>
+      {{else}}
+      <h1 class="text-3xl font-black tracking-tight">You're in, {{.Order.Name}}.</h1>
+      <p class="mt-1 text-zinc-400">Order <span class="font-mono text-zinc-300">#TP-{{.Order.ID}}</span> · {{len .Tickets}} ticket{{if ne (len .Tickets) 1}}s{{end}} · {{money .Order.TotalCents}} · confirmation sent to {{.Order.Email}}</p>
+      {{if .Order.DiscountCents}}
+      <p class="mt-1 text-sm text-emerald-400">Promo {{.Order.PromoCode}} saved you {{money .Order.DiscountCents}}</p>
+      {{end}}
+      {{end}}
+    </div>
+  </div>
+
+  <div class="mt-10 space-y-6">
+    {{range .Tickets}}
+    <div class="ticket flex overflow-hidden rounded-2xl border border-white/10 bg-zinc-900{{if eq $.Order.Status "refunded"}} opacity-40 saturate-50{{end}}">
+      <div class="w-2.5 shrink-0 bg-gradient-to-b {{.Gradient}}"></div>
+      <div class="flex-1 p-6">
+        <p class="text-xs font-bold uppercase tracking-widest text-fuchsia-400">{{.Title}}</p>
+        <h2 class="mt-1 text-2xl font-black tracking-tight">{{.Artist}}</h2>
+        <p class="mt-1 text-sm text-zinc-400">{{.Venue}} · {{.City}} · {{datefmt .StartsAt}}</p>
+        <div class="mt-5 flex flex-wrap items-end gap-x-10 gap-y-3">
+          <div>
+            <p class="text-[10px] font-bold uppercase tracking-widest text-zinc-500">Section</p>
+            <p class="text-lg font-bold">{{.Section}}</p>
+          </div>
+          <div>
+            <p class="text-[10px] font-bold uppercase tracking-widest text-zinc-500">Row</p>
+            <p class="text-lg font-bold">{{.Row}}</p>
+          </div>
+          <div>
+            <p class="text-[10px] font-bold uppercase tracking-widest text-zinc-500">Seat</p>
+            <p class="text-lg font-bold">{{.Number}}</p>
+          </div>
+        </div>
+      </div>
+      <div class="ticket-stub relative flex w-44 shrink-0 flex-col items-center justify-center gap-2 border-l-2 border-dashed border-white/15 bg-zinc-950/60 p-5">
+        <div class="h-24 w-24 rounded-lg bg-white p-1.5">{{qr .Code}}</div>
+        <p class="font-mono text-xs font-bold tracking-widest text-zinc-300">{{.Code}}</p>
+      </div>
+    </div>
+    {{end}}
+  </div>
+
+  <div class="mt-10 flex items-center justify-between">
+    <a href="/" class="text-sm font-semibold text-fuchsia-400 hover:text-fuchsia-300">← Browse more events</a>
+    {{if and .IsOwner (eq .Order.Status "paid")}}
+    <button hx-post="/orders/{{.Order.ID}}/refund" hx-confirm="Refund this order? All {{len .Tickets}} seat{{if ne (len .Tickets) 1}}s{{end}} will be released and {{money .Order.TotalCents}} returned."
+      class="rounded-xl border border-white/10 px-4 py-2.5 text-sm font-medium text-zinc-400 transition-colors hover:border-rose-500/40 hover:text-rose-300">
+      Refund order
+    </button>
+    {{end}}
+  </div>
+</main>
+
+{{template "foot" .}}
+{{end}}

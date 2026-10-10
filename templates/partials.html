@@ -1,0 +1,115 @@
+{{define "head"}}
+<!doctype html>
+<html lang="en" class="scroll-smooth">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{if .}}{{.}} · {{end}}ticketpunch</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script>
+tailwind.config = {
+  theme: {
+    extend: {
+      fontFamily: { sans: ['Inter', 'ui-sans-serif', 'system-ui', 'sans-serif'] },
+      boxShadow: { glow: '0 0 40px -10px rgba(217,70,239,.5)' },
+    }
+  }
+}
+</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
+<script src="https://unpkg.com/htmx.org@2.0.4" crossorigin="anonymous"></script>
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body class="bg-zinc-950 text-zinc-100 font-sans antialiased min-h-screen">
+{{end}}
+
+{{define "nav"}}
+<nav class="sticky top-0 z-50 border-b border-white/10 bg-zinc-950/80 backdrop-blur-xl">
+  <div class="mx-auto flex max-w-7xl items-center justify-between px-6 py-4">
+    <a href="/" class="flex items-center gap-2.5 group">
+      <span class="grid h-8 w-8 place-items-center rounded-lg bg-gradient-to-br from-fuchsia-500 to-violet-600 shadow-glow transition-transform group-hover:scale-110">
+        <svg class="h-4.5 w-4.5 h-5 w-5 text-white" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 9a3 3 0 0 1 0 6v2a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-2a3 3 0 0 1 0-6V7a2 2 0 0 0-2-2H4a2 2 0 0 0-2 2Z"/><path d="M13 5v2"/><path d="M13 17v2"/><path d="M13 11v2"/></svg>
+      </span>
+      <span class="text-lg font-extrabold tracking-tight">ticket<span class="text-fuchsia-400">punch</span></span>
+    </a>
+    <a href="/" class="text-sm font-medium text-zinc-400 transition-colors hover:text-white">Browse events</a>
+  </div>
+</nav>
+{{end}}
+
+{{define "foot"}}
+<footer class="mt-24 border-t border-white/10 py-10">
+  <div class="mx-auto max-w-7xl px-6 text-sm text-zinc-500">
+    ticketpunch — a demo ticketing app. No real payments are processed.
+  </div>
+</footer>
+</body>
+</html>
+{{end}}
+
+{{define "seatbtn"}}
+{{$state := .SeatState}}
+<button type="button"
+  class="seat seat-{{$state}}"
+  title="{{.Section}} · Row {{.Row}} · Seat {{.Number}} — {{money .PriceCents}}"
+  {{if ne $state "sold"}}hx-post="/events/{{.EventID}}/seats/{{.ID}}/toggle" hx-swap="outerHTML" hx-target="this"{{else}}disabled{{end}}>
+  <span class="sr-only">{{.Section}} row {{.Row}} seat {{.Number}}</span>
+</button>
+{{end}}
+
+{{define "promobanner.html"}}
+{{if .}}
+<div class="bg-gradient-to-r from-fuchsia-600 via-violet-600 to-indigo-600">
+  <div class="mx-auto flex max-w-7xl flex-wrap items-center justify-center gap-x-3 gap-y-1 px-6 py-2.5 text-center text-sm">
+    <span class="font-semibold text-white">New here? Take {{.PercentOff}}% off your first order with</span>
+    <span class="rounded-md bg-white/15 px-2.5 py-0.5 font-mono text-xs font-bold tracking-widest text-white">{{.Code}}</span>
+    {{if .ExpiresLabel}}<span class="text-fuchsia-100">· ends {{.ExpiresLabel}}</span>{{end}}
+  </div>
+</div>
+{{end}}
+{{end}}
+
+{{define "cart.html"}}
+<div id="cart" hx-swap-oob="outerHTML" class="rounded-2xl border border-white/10 bg-zinc-900/80 p-6 backdrop-blur">
+  <div class="flex items-center justify-between">
+    <h3 class="text-sm font-bold uppercase tracking-widest text-zinc-400">Your seats</h3>
+    {{if .Seats}}
+    <button hx-post="/events/{{.EventID}}/cart/clear" hx-target="#seatmap" hx-swap="innerHTML"
+      class="text-xs font-medium text-zinc-500 transition-colors hover:text-rose-400">Clear all</button>
+    {{end}}
+  </div>
+  {{if .Err}}
+  <div class="mt-3 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs font-medium text-amber-300">{{.Err}}</div>
+  {{end}}
+  {{if .Seats}}
+  <ul class="mt-4 space-y-2.5">
+    {{range .Seats}}
+    <li class="flex items-center justify-between rounded-lg bg-white/5 px-3 py-2 text-sm">
+      <span class="font-medium">{{.Section}} · {{.Label}}</span>
+      <span class="text-zinc-400">{{money .PriceCents}}</span>
+    </li>
+    {{end}}
+  </ul>
+  <div class="mt-5 flex items-center justify-between border-t border-white/10 pt-4">
+    <span class="text-sm text-zinc-400">Total</span>
+    <span class="text-xl font-extrabold">{{money .TotalCents}}</span>
+  </div>
+  <a href="/checkout" class="mt-5 block rounded-xl bg-gradient-to-r from-fuchsia-500 to-violet-600 px-4 py-3 text-center text-sm font-bold shadow-glow transition-transform hover:scale-[1.02] active:scale-95">
+    Checkout →
+  </a>
+  {{else}}
+  <p class="mt-4 text-sm text-zinc-500">Tap any open seat on the map to add it here.</p>
+  {{end}}
+  {{if .Used}}
+  <p class="mt-4 text-xs text-zinc-500">{{.Used}} of {{.Max}} tickets for this event</p>
+  {{end}}
+</div>
+{{end}}
+
+{{define "payerr.html"}}
+{{if .Err}}
+<div class="rounded-xl border border-rose-500/30 bg-rose-500/10 px-4 py-3 text-sm text-rose-300">{{.Err}}</div>
+{{end}}
+{{end}}
