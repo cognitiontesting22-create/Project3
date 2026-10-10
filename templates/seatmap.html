@@ -1,0 +1,33 @@
+{{define "seatmap.html"}}
+<div class="mx-auto max-w-md">
+  <div class="h-2 rounded-full bg-gradient-to-r from-transparent via-fuchsia-400 to-transparent shadow-glow"></div>
+  <p class="mt-2 text-center text-[10px] font-bold uppercase tracking-[0.4em] text-zinc-500">Stage</p>
+</div>
+
+{{range .Sections}}
+<section>
+  <div class="mb-3 flex items-baseline justify-between">
+    <h3 class="text-sm font-bold uppercase tracking-widest text-zinc-300">{{.Name}}</h3>
+    <span class="text-xs text-zinc-500">{{money .PriceCents}}</span>
+  </div>
+  <div class="space-y-1.5 overflow-x-auto pb-1">
+    {{range .Rows}}
+    {{$row := .}}
+    <div class="flex items-center justify-center gap-1">
+      <span class="w-4 shrink-0 text-center text-[9px] font-bold text-zinc-600">{{$row.Label}}</span>
+      {{range $i, $seat := $row.Seats}}
+      {{if eq $i (div2 (len $row.Seats))}}<div class="w-4 shrink-0"></div>{{end}}
+      {{template "seatbtn" $seat}}
+      {{end}}
+      <span class="w-4 shrink-0 text-center text-[9px] font-bold text-zinc-600">{{$row.Label}}</span>
+    </div>
+    {{end}}
+  </div>
+</section>
+{{end}}
+{{end}}
+
+{{define "clearresp.html"}}
+{{template "seatmap.html" .}}
+{{template "cart.html" .Cart}}
+{{end}}

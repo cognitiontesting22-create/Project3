@@ -1,0 +1,49 @@
+{{define "waitlistcard.html"}}
+<div id="waitlist-card">{{template "waitlist.html" .}}</div>
+{{end}}
+
+{{define "waitlist.html"}}
+{{if .}}
+{{if eq .State "offered"}}
+<div class="rounded-2xl border border-emerald-500/40 bg-emerald-500/10 p-6">
+  <div class="flex items-center gap-2">
+    <span class="relative flex h-2.5 w-2.5">
+      <span class="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-400 opacity-75"></span>
+      <span class="relative inline-flex h-2.5 w-2.5 rounded-full bg-emerald-400"></span>
+    </span>
+    <h3 class="text-sm font-bold uppercase tracking-widest text-emerald-300">A seat opened up</h3>
+  </div>
+  <p class="mt-3 text-sm text-zinc-200"><span class="font-bold">{{.SeatLabel}}</span> is being held for you — it's already in your cart.</p>
+  <p class="mt-1 text-xs text-zinc-400">You have about {{.MinutesLeft}} min to check out before it goes to the next person in line.</p>
+  <div class="mt-4 flex items-center gap-3">
+    <a href="/checkout" class="rounded-xl bg-emerald-500 px-4 py-2.5 text-sm font-bold text-zinc-950 transition-transform hover:scale-[1.02]">Claim it →</a>
+    <button hx-post="/events/{{.EventID}}/waitlist/leave" hx-target="#waitlist-card" hx-swap="outerHTML" hx-confirm="Give up this seat? It'll go to the next person in line."
+      class="text-xs font-medium text-zinc-500 transition-colors hover:text-rose-400">Decline</button>
+  </div>
+</div>
+{{else}}
+<div class="rounded-2xl border border-white/10 bg-zinc-900/80 p-6 backdrop-blur">
+  {{if eq .State "waiting"}}
+  <div class="flex items-center justify-between">
+    <h3 class="text-sm font-bold uppercase tracking-widest text-zinc-400">Waitlist</h3>
+    <span class="rounded-full bg-fuchsia-500/15 px-2.5 py-0.5 text-xs font-bold text-fuchsia-300">#{{.Position}} in line</span>
+  </div>
+  <p class="mt-3 text-sm text-zinc-400">We'll hold the next freed seat for you for 15 minutes. Keep an eye on <span class="text-zinc-200">{{.Email}}</span>.</p>
+  <button hx-post="/events/{{.EventID}}/waitlist/leave" hx-target="#waitlist-card" hx-swap="outerHTML" hx-confirm="Leave the waitlist?"
+    class="mt-4 text-xs font-medium text-zinc-500 transition-colors hover:text-rose-400">Leave waitlist</button>
+  {{else}}
+  <h3 class="text-sm font-bold uppercase tracking-widest text-zinc-400">Sold out</h3>
+  <p class="mt-3 text-sm text-zinc-400">This show is full. Join the waitlist and we'll hold the next freed seat for you for 15 minutes.</p>
+  {{if .Err}}
+  <div class="mt-3 rounded-lg border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-xs font-medium text-rose-300">{{.Err}}</div>
+  {{end}}
+  <form hx-post="/events/{{.EventID}}/waitlist" hx-target="#waitlist-card" hx-swap="outerHTML" class="mt-4 flex gap-2">
+    <input name="email" type="email" required placeholder="you@example.com"
+      class="w-full rounded-xl border border-white/10 bg-zinc-950 px-4 py-2.5 text-sm outline-none transition-colors placeholder:text-zinc-600 focus:border-fuchsia-500">
+    <button type="submit" class="shrink-0 rounded-xl bg-gradient-to-r from-fuchsia-500 to-violet-600 px-4 py-2.5 text-sm font-bold shadow-glow transition-transform hover:scale-[1.02]">Notify me</button>
+  </form>
+  {{end}}
+</div>
+{{end}}
+{{end}}
+{{end}}

@@ -1,0 +1,112 @@
+{{define "checkout.html"}}
+{{template "head" "Checkout"}}
+{{template "nav" .}}
+
+<main class="mx-auto max-w-5xl px-6 py-14">
+  <a href="/events/{{.Event.ID}}" class="text-sm text-zinc-500 transition-colors hover:text-white">← Back to seat map</a>
+  <h1 class="mt-3 text-3xl font-black tracking-tight">Checkout</h1>
+  <p class="mt-1 text-zinc-400">{{.Event.Artist}} — {{.Event.Title}} · {{.Event.Venue}}, {{.Event.City}} · {{datefmt .Event.StartsAt}}</p>
+
+  <div class="mt-10 grid gap-10 md:grid-cols-[1fr_340px]">
+    <form hx-post="/checkout" hx-target="#payerr" hx-swap="innerHTML" hx-indicator="#spinner" hx-disabled-elt="button[type=submit]" class="space-y-6">
+      <section class="rounded-2xl border border-white/10 bg-zinc-900/80 p-6">
+        <h2 class="text-sm font-bold uppercase tracking-widest text-zinc-400">Contact</h2>
+        <div class="mt-4 grid gap-4 sm:grid-cols-2">
+          <label class="block">
+            <span class="text-xs font-medium text-zinc-400">Full name</span>
+            <input name="name" required autocomplete="name" placeholder="Alex Rivera"
+              class="mt-1.5 w-full rounded-xl border border-white/10 bg-zinc-950 px-4 py-2.5 text-sm outline-none transition-colors placeholder:text-zinc-600 focus:border-fuchsia-500">
+          </label>
+          <label class="block">
+            <span class="text-xs font-medium text-zinc-400">Email</span>
+            <input name="email" type="email" required autocomplete="email" placeholder="alex@example.com"
+              class="mt-1.5 w-full rounded-xl border border-white/10 bg-zinc-950 px-4 py-2.5 text-sm outline-none transition-colors placeholder:text-zinc-600 focus:border-fuchsia-500">
+          </label>
+        </div>
+      </section>
+
+      <section class="rounded-2xl border border-white/10 bg-zinc-900/80 p-6">
+        <h2 class="text-sm font-bold uppercase tracking-widest text-zinc-400">Promo code</h2>
+        <div class="mt-4 flex gap-3">
+          <input name="promo" value="{{.PromoCode}}" placeholder="ENCORE20" autocomplete="off"
+            class="w-full rounded-xl border border-white/10 bg-zinc-950 px-4 py-2.5 font-mono text-sm uppercase tracking-widest outline-none transition-colors placeholder:text-zinc-600 focus:border-fuchsia-500">
+          <button type="button" hx-post="/checkout/promo" hx-include="closest form" hx-target="#summary" hx-swap="outerHTML"
+            class="shrink-0 rounded-xl border border-fuchsia-500/40 px-5 py-2.5 text-sm font-bold text-fuchsia-300 transition-colors hover:bg-fuchsia-500/10">
+            Apply
+          </button>
+        </div>
+      </section>
+
+      <section class="rounded-2xl border border-white/10 bg-zinc-900/80 p-6">
+        <div class="flex items-center justify-between">
+          <h2 class="text-sm font-bold uppercase tracking-widest text-zinc-400">Payment</h2>
+          <span class="rounded-full bg-amber-500/10 px-2.5 py-0.5 text-[10px] font-bold uppercase tracking-wider text-amber-400">Test mode</span>
+        </div>
+        <div class="mt-4 space-y-4">
+          <label class="block">
+            <span class="text-xs font-medium text-zinc-400">Card number</span>
+            <input name="card" required inputmode="numeric" placeholder="4242 4242 4242 4242" maxlength="19"
+              class="mt-1.5 w-full rounded-xl border border-white/10 bg-zinc-950 px-4 py-2.5 text-sm tracking-wider outline-none transition-colors placeholder:text-zinc-600 focus:border-fuchsia-500">
+          </label>
+          <div class="grid grid-cols-2 gap-4">
+            <label class="block">
+              <span class="text-xs font-medium text-zinc-400">Expiry</span>
+              <input name="expiry" required placeholder="12 / 28"
+                class="mt-1.5 w-full rounded-xl border border-white/10 bg-zinc-950 px-4 py-2.5 text-sm outline-none transition-colors placeholder:text-zinc-600 focus:border-fuchsia-500">
+            </label>
+            <label class="block">
+              <span class="text-xs font-medium text-zinc-400">CVC</span>
+              <input name="cvc" required inputmode="numeric" placeholder="123" maxlength="4"
+                class="mt-1.5 w-full rounded-xl border border-white/10 bg-zinc-950 px-4 py-2.5 text-sm outline-none transition-colors placeholder:text-zinc-600 focus:border-fuchsia-500">
+            </label>
+          </div>
+          <p class="text-xs text-zinc-500">Demo checkout — any 16-digit number succeeds. <span class="text-zinc-400">4000 0000 0000 0002</span> simulates a decline.</p>
+        </div>
+      </section>
+
+      <div id="payerr">{{template "payerr.html" .}}</div>
+
+      <button type="submit" class="group relative w-full overflow-hidden rounded-xl bg-gradient-to-r from-fuchsia-500 to-violet-600 px-4 py-4 text-sm font-bold shadow-glow transition-transform hover:scale-[1.01] active:scale-[0.99]">
+        <span class="htmx-indicator" id="spinner">
+          <svg class="inline h-4 w-4 animate-spin" viewBox="0 0 24 24" fill="none"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"/><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 0 1 8-8v4a4 4 0 0 0-4 4H4z"/></svg>
+          Processing…
+        </span>
+        <span class="htmx-indicator-inverse">Pay {{money .TotalCents}}</span>
+      </button>
+    </form>
+
+    {{template "summary.html" .}}
+  </div>
+</main>
+
+{{template "foot" .}}
+{{end}}
+
+{{define "summary.html"}}
+<aside id="summary" class="self-start rounded-2xl border border-white/10 bg-zinc-900/80 p-6">
+  <h2 class="text-sm font-bold uppercase tracking-widest text-zinc-400">Order summary</h2>
+  <ul class="mt-4 space-y-2.5">
+    {{range .Seats}}
+    <li class="flex items-center justify-between rounded-lg bg-white/5 px-3 py-2 text-sm">
+      <div>
+        <p class="font-medium">{{.Section}} · {{.Label}}</p>
+        <p class="text-xs text-zinc-500">{{.EventName}}</p>
+      </div>
+      <span class="text-zinc-400">{{money .PriceCents}}</span>
+    </li>
+    {{end}}
+  </ul>
+  <div class="mt-5 space-y-1.5 border-t border-white/10 pt-4 text-sm">
+    <div class="flex justify-between text-zinc-400"><span>Subtotal</span><span>{{money .SubtotalCents}}</span></div>
+    {{if .DiscountCents}}
+    <div class="flex justify-between font-medium text-emerald-400"><span>Promo {{.PromoCode}}</span><span>−{{money .DiscountCents}}</span></div>
+    {{end}}
+    {{if .PromoErr}}
+    <p class="text-xs font-medium text-rose-400">{{.PromoErr}}</p>
+    {{else if .DiscountCents}}
+    <p class="text-xs font-medium text-emerald-400">Promo applied</p>
+    {{end}}
+    <div class="flex justify-between pt-1 text-lg font-extrabold"><span>Total</span><span>{{money .TotalCents}}</span></div>
+  </div>
+</aside>
+{{end}}
