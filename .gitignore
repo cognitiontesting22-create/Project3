@@ -1,0 +1,5 @@
+# build output
+ticketpunch
+
+# local database — seeded on first run
+tickets.db
