@@ -35,7 +35,33 @@ func main() {
 		log.Fatal(err)
 	}
 
-	tpl = template.Must(template.New("").Funcs(template.FuncMap{
+	tpl = parseTemplates()
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /", handleIndex)
+	mux.HandleFunc("GET /events/{id}", handleEvent)
+	mux.HandleFunc("POST /events/{id}/seats/{seatID}/toggle", handleToggleSeat)
+	mux.HandleFunc("POST /events/{id}/cart/clear", handleClearCart)
+	mux.HandleFunc("POST /events/{id}/best", handlePickBest)
+	mux.HandleFunc("POST /events/{id}/waitlist", handleJoinWaitlist)
+	mux.HandleFunc("POST /events/{id}/waitlist/leave", handleLeaveWaitlist)
+	mux.HandleFunc("POST /orders/{id}/refund", handleRefund)
+	mux.HandleFunc("GET /checkout", handleCheckoutPage)
+	mux.HandleFunc("POST /checkout/promo", handleApplyPromo)
+	mux.HandleFunc("POST /checkout", handleCheckout)
+	mux.HandleFunc("GET /orders/{id}", handleOrder)
+	mux.HandleFunc("GET /admin", handleAdmin)
+	mux.HandleFunc("GET /admin/report", handleAdminReport)
+	mux.HandleFunc("GET /admin/report.csv", handleAdminCSV)
+	mux.Handle("GET /static/", http.FileServerFS(assets))
+
+	addr := ":8080"
+	log.Printf("ticketpunch listening on http://localhost%s", addr)
+	log.Fatal(http.ListenAndServe(addr, sessionMiddleware(mux)))
+}
+
+func parseTemplates() *template.Template {
+	return template.Must(template.New("").Funcs(template.FuncMap{
 		"money": func(cents int64) string { return fmt.Sprintf("$%.2f", float64(cents)/100) },
 		"qr":    qrSVG,
 		"datefmt": func(iso string) string {
@@ -46,25 +72,14 @@ func main() {
 			return t.Format("Mon, Jan 2 · 3:04 PM")
 		},
 		"div2": func(n int) int { return n / 2 },
+		"seq": func(lo, hi int) []int {
+			out := make([]int, 0, hi-lo+1)
+			for i := lo; i <= hi; i++ {
+				out = append(out, i)
+			}
+			return out
+		},
 	}).ParseFS(assets, "templates/*.html"))
-
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /", handleIndex)
-	mux.HandleFunc("GET /events/{id}", handleEvent)
-	mux.HandleFunc("POST /events/{id}/seats/{seatID}/toggle", handleToggleSeat)
-	mux.HandleFunc("POST /events/{id}/cart/clear", handleClearCart)
-	mux.HandleFunc("POST /events/{id}/waitlist", handleJoinWaitlist)
-	mux.HandleFunc("POST /events/{id}/waitlist/leave", handleLeaveWaitlist)
-	mux.HandleFunc("POST /orders/{id}/refund", handleRefund)
-	mux.HandleFunc("GET /checkout", handleCheckoutPage)
-	mux.HandleFunc("POST /checkout/promo", handleApplyPromo)
-	mux.HandleFunc("POST /checkout", handleCheckout)
-	mux.HandleFunc("GET /orders/{id}", handleOrder)
-	mux.Handle("GET /static/", http.FileServerFS(assets))
-
-	addr := ":8080"
-	log.Printf("ticketpunch listening on http://localhost%s", addr)
-	log.Fatal(http.ListenAndServe(addr, sessionMiddleware(mux)))
 }
 
 func sessionMiddleware(next http.Handler) http.Handler {
