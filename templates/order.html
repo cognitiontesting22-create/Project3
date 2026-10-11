@@ -14,6 +14,9 @@
       {{else}}
       <h1 class="text-3xl font-black tracking-tight">You're in, {{.Order.Name}}.</h1>
       <p class="mt-1 text-zinc-400">Order <span class="font-mono text-zinc-300">#TP-{{.Order.ID}}</span> · {{len .Tickets}} ticket{{if ne (len .Tickets) 1}}s{{end}} · {{money .Order.TotalCents}} · confirmation sent to {{.Order.Email}}</p>
+      {{if .Order.GroupDiscountCents}}
+      <p class="mt-1 text-sm text-emerald-400">Group deal saved you {{money .Order.GroupDiscountCents}}</p>
+      {{end}}
       {{if .Order.DiscountCents}}
       <p class="mt-1 text-sm text-emerald-400">Promo {{.Order.PromoCode}} saved you {{money .Order.DiscountCents}}</p>
       {{end}}
@@ -42,6 +45,12 @@
             <p class="text-[10px] font-bold uppercase tracking-widest text-zinc-500">Seat</p>
             <p class="text-lg font-bold">{{.Number}}</p>
           </div>
+          {{if .Tier}}
+          <div>
+            <p class="text-[10px] font-bold uppercase tracking-widest text-zinc-500">Tier</p>
+            <p class="text-lg font-bold">{{.Tier}}</p>
+          </div>
+          {{end}}
         </div>
       </div>
       <div class="ticket-stub relative flex w-44 shrink-0 flex-col items-center justify-center gap-2 border-l-2 border-dashed border-white/15 bg-zinc-950/60 p-5">

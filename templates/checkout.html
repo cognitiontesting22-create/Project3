@@ -89,7 +89,7 @@
     {{range .Seats}}
     <li class="flex items-center justify-between rounded-lg bg-white/5 px-3 py-2 text-sm">
       <div>
-        <p class="font-medium">{{.Section}} · {{.Label}}</p>
+        <p class="font-medium">{{.Section}} · {{.Label}} <span class="text-xs font-normal text-zinc-500">{{.Tier}}</span></p>
         <p class="text-xs text-zinc-500">{{.EventName}}</p>
       </div>
       <span class="text-zinc-400">{{money .PriceCents}}</span>
@@ -98,6 +98,9 @@
   </ul>
   <div class="mt-5 space-y-1.5 border-t border-white/10 pt-4 text-sm">
     <div class="flex justify-between text-zinc-400"><span>Subtotal</span><span>{{money .SubtotalCents}}</span></div>
+    {{if .GroupCents}}
+    <div class="flex justify-between font-medium text-emerald-400"><span>Group deal</span><span>−{{money .GroupCents}}</span></div>
+    {{end}}
     {{if .DiscountCents}}
     <div class="flex justify-between font-medium text-emerald-400"><span>Promo {{.PromoCode}}</span><span>−{{money .DiscountCents}}</span></div>
     {{end}}

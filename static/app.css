@@ -15,6 +15,46 @@
   transform: scale(1.35);
   box-shadow: 0 0 10px rgba(52, 211, 153, 0.5);
 }
+.seat-available.tier-Premium,
+.seat-demo.tier-Premium {
+  background: rgba(167, 139, 250, 0.6);
+}
+.seat-available.tier-Premium:hover {
+  background: #a78bfa;
+  box-shadow: 0 0 10px rgba(167, 139, 250, 0.6);
+}
+.seat-available.tier-Standard,
+.seat-demo.tier-Standard {
+  background: rgba(56, 189, 248, 0.5);
+}
+.seat-available.tier-Standard:hover {
+  background: #38bdf8;
+  box-shadow: 0 0 10px rgba(56, 189, 248, 0.55);
+}
+.seat-available.tier-Value,
+.seat-demo.tier-Value {
+  background: #3f3f46;
+}
+.seat-available.tier-Value:hover {
+  background: #a1a1aa;
+  box-shadow: 0 0 10px rgba(161, 161, 170, 0.45);
+}
+.tier-dot {
+  display: inline-block;
+  width: 0.55rem;
+  height: 0.55rem;
+  border-radius: 9999px;
+  margin-right: 0.3rem;
+}
+.tier-dot.tier-Premium {
+  background: #a78bfa;
+}
+.tier-dot.tier-Standard {
+  background: #38bdf8;
+}
+.tier-dot.tier-Value {
+  background: #71717a;
+}
 .seat-selected {
   background: #fbbf24;
   box-shadow: 0 0 10px rgba(251, 191, 36, 0.5);

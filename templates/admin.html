@@ -1,0 +1,127 @@
+{{define "admin.html"}}
+{{template "head" "Sales report"}}
+{{template "nav" .}}
+
+<main class="mx-auto max-w-6xl px-6 py-14">
+  <div class="flex flex-wrap items-end justify-between gap-4">
+    <div>
+      <h1 class="text-3xl font-black tracking-tight">Sales report</h1>
+      <p class="mt-1 text-zinc-400">Live — refreshes every 5 seconds with your current filters.</p>
+    </div>
+    <span class="flex items-center gap-2 text-xs font-semibold text-emerald-400">
+      <span class="relative flex h-2 w-2">
+        <span class="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-400 opacity-75"></span>
+        <span class="relative inline-flex h-2 w-2 rounded-full bg-emerald-400"></span>
+      </span>
+      Live
+    </span>
+  </div>
+
+  <form hx-get="/admin/report" hx-target="#report" hx-swap="innerHTML" hx-trigger="change, every 5s"
+    class="mt-8 flex flex-wrap items-end gap-x-6 gap-y-4 rounded-2xl border border-white/10 bg-zinc-900/80 p-5">
+    <label class="block">
+      <span class="text-xs font-medium text-zinc-400">Event</span>
+      <select name="event_id" class="mt-1.5 block rounded-xl border border-white/10 bg-zinc-950 px-4 py-2.5 text-sm outline-none transition-colors focus:border-fuchsia-500">
+        <option value="0">All events</option>
+        {{range .Events}}
+        <option value="{{.ID}}" {{if eq .ID $.F.EventID}}selected{{end}}>{{.Artist}} — {{.Title}}</option>
+        {{end}}
+      </select>
+    </label>
+    <label class="block">
+      <span class="text-xs font-medium text-zinc-400">Orders from</span>
+      <input type="date" name="from" value="{{.F.From}}"
+        class="mt-1.5 block rounded-xl border border-white/10 bg-zinc-950 px-4 py-2.5 text-sm outline-none transition-colors focus:border-fuchsia-500">
+    </label>
+    <label class="block">
+      <span class="text-xs font-medium text-zinc-400">to</span>
+      <input type="date" name="to" value="{{.F.To}}"
+        class="mt-1.5 block rounded-xl border border-white/10 bg-zinc-950 px-4 py-2.5 text-sm outline-none transition-colors focus:border-fuchsia-500">
+    </label>
+    <p class="max-w-xs pb-1 text-xs text-zinc-500">Dates filter by order date — refunds count by their refund date. Held is always right now.</p>
+  </form>
+
+  <div id="report" class="mt-8">
+    {{template "report.html" .}}
+  </div>
+</main>
+
+{{template "foot" .}}
+{{end}}
+
+{{define "report.html"}}
+<div class="grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-5">
+  <div class="rounded-2xl border border-white/10 bg-zinc-900/80 p-5">
+    <p class="text-xs font-bold uppercase tracking-widest text-zinc-500">Net revenue</p>
+    <p class="mt-2 text-2xl font-black text-emerald-400">{{money .Total.NetCents}}</p>
+  </div>
+  <div class="rounded-2xl border border-white/10 bg-zinc-900/80 p-5">
+    <p class="text-xs font-bold uppercase tracking-widest text-zinc-500">Tickets sold</p>
+    <p class="mt-2 text-2xl font-black">{{.Total.Sold}}</p>
+  </div>
+  <div class="rounded-2xl border border-white/10 bg-zinc-900/80 p-5">
+    <p class="text-xs font-bold uppercase tracking-widest text-zinc-500">Held now</p>
+    <p class="mt-2 text-2xl font-black text-amber-400">{{.Total.Held}}</p>
+  </div>
+  <div class="rounded-2xl border border-white/10 bg-zinc-900/80 p-5">
+    <p class="text-xs font-bold uppercase tracking-widest text-zinc-500">Refunded</p>
+    <p class="mt-2 text-2xl font-black text-rose-400">{{.Total.Refunded}}</p>
+  </div>
+  <div class="rounded-2xl border border-white/10 bg-zinc-900/80 p-5">
+    <p class="text-xs font-bold uppercase tracking-widest text-zinc-500">Promo orders</p>
+    <p class="mt-2 text-2xl font-black text-fuchsia-400">{{.Total.PromoOrders}}</p>
+  </div>
+</div>
+
+<div class="mt-8 overflow-hidden rounded-2xl border border-white/10">
+  <div class="flex items-center justify-between border-b border-white/10 bg-zinc-900/80 px-5 py-3">
+    <span class="text-xs font-bold uppercase tracking-widest text-zinc-400">Per event</span>
+    <a href="{{.CSVURL}}" class="text-xs font-semibold text-fuchsia-400 transition-colors hover:text-fuchsia-300">Download CSV ↓</a>
+  </div>
+  <div class="overflow-x-auto">
+    <table class="w-full text-sm">
+      <thead>
+        <tr class="border-b border-white/10 text-left text-xs uppercase tracking-wider text-zinc-500">
+          <th class="px-5 py-3 font-semibold">Event</th>
+          <th class="px-4 py-3 text-right font-semibold">Sold</th>
+          <th class="px-4 py-3 text-right font-semibold">Held</th>
+          <th class="px-4 py-3 text-right font-semibold">Refunded</th>
+          <th class="px-4 py-3 text-right font-semibold">Promo</th>
+          <th class="px-4 py-3 text-right font-semibold">Gross</th>
+          <th class="px-4 py-3 text-right font-semibold">Discounts</th>
+          <th class="px-5 py-3 text-right font-semibold">Net</th>
+        </tr>
+      </thead>
+      <tbody class="divide-y divide-white/5">
+        {{range .Rows}}
+        <tr class="transition-colors hover:bg-white/[0.02]">
+          <td class="px-5 py-3.5">
+            <p class="font-semibold">{{.Artist}}</p>
+            <p class="text-xs text-zinc-500">{{.Title}} · {{datefmt .StartsAt}}</p>
+          </td>
+          <td class="px-4 py-3.5 text-right font-medium">{{.Sold}}</td>
+          <td class="px-4 py-3.5 text-right text-amber-300">{{.Held}}</td>
+          <td class="px-4 py-3.5 text-right text-rose-300">{{.Refunded}}</td>
+          <td class="px-4 py-3.5 text-right text-fuchsia-300">{{.PromoOrders}}</td>
+          <td class="px-4 py-3.5 text-right text-zinc-400">{{money .GrossCents}}</td>
+          <td class="px-4 py-3.5 text-right text-zinc-400">{{if .DiscountCents}}−{{money .DiscountCents}}{{else}}—{{end}}</td>
+          <td class="px-5 py-3.5 text-right font-bold text-emerald-400">{{money .NetCents}}</td>
+        </tr>
+        {{end}}
+      </tbody>
+      <tfoot>
+        <tr class="border-t border-white/10 bg-white/[0.03] font-bold">
+          <td class="px-5 py-3.5">Total</td>
+          <td class="px-4 py-3.5 text-right">{{.Total.Sold}}</td>
+          <td class="px-4 py-3.5 text-right">{{.Total.Held}}</td>
+          <td class="px-4 py-3.5 text-right">{{.Total.Refunded}}</td>
+          <td class="px-4 py-3.5 text-right">{{.Total.PromoOrders}}</td>
+          <td class="px-4 py-3.5 text-right">{{money .Total.GrossCents}}</td>
+          <td class="px-4 py-3.5 text-right">−{{money .Total.DiscountCents}}</td>
+          <td class="px-5 py-3.5 text-right text-emerald-400">{{money .Total.NetCents}}</td>
+        </tr>
+      </tfoot>
+    </table>
+  </div>
+</div>
+{{end}}
