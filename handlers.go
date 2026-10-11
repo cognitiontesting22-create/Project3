@@ -4,12 +4,15 @@ import (
 	"context"
 	"crypto/sha256"
 	"database/sql"
+	"encoding/csv"
 	"errors"
 	"fmt"
 	"html/template"
 	"log"
 	"math"
 	"net/http"
+	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -49,6 +52,7 @@ type Seat struct {
 	Number      int64
 	PriceCents  int64
 	Status      string // raw status: available | held | sold
+	Tier        string // Premium | Standard | Value
 	HoldSession string
 	Viewer      string // requesting session, used to render state
 	EventName   string // "Artist — Title", populated for cart/checkout views
@@ -81,18 +85,76 @@ type SeatRow struct {
 	Seats []Seat
 }
 
+type SeatTier struct {
+	Name       string
+	PriceCents int64
+}
+
 type SeatSection struct {
 	Name       string
 	PriceCents int64
+	Tiers      []SeatTier // distinct tiers in front-to-back order
 	Rows       []SeatRow
 }
 
 const maxTicketsPerEvent = 6
 
+// groupDealPct is the automatic discount applied to every contiguous run of
+// 2+ seats in the same row — "sit together, save together".
+const groupDealPct = 10
+
+// groupDiscount sums the deal across a set of seats. Seats are grouped by
+// event+section+row; each maximal run of consecutive seat numbers of length
+// 2+ earns groupDealPct off its subtotal.
+func groupDiscount(seats []Seat) int64 {
+	type key struct {
+		eventID      int64
+		section, row string
+	}
+	runs := map[key][]Seat{}
+	var order []key
+	for _, s := range seats {
+		k := key{s.EventID, s.Section, s.Row}
+		if _, ok := runs[k]; !ok {
+			order = append(order, k)
+		}
+		runs[k] = append(runs[k], s)
+	}
+	var total int64
+	for _, k := range order {
+		g := runs[k]
+		sort.Slice(g, func(i, j int) bool { return g[i].Number < g[j].Number })
+		start := 0
+		for i := 1; i <= len(g); i++ {
+			if i < len(g) && g[i].Number == g[i-1].Number+1 {
+				continue
+			}
+			if i-start >= 2 {
+				var run int64
+				for _, s := range g[start:i] {
+					run += s.PriceCents
+				}
+				total += run * groupDealPct / 100
+			}
+			start = i
+		}
+	}
+	return total
+}
+
+func countByEvent(seats []Seat) map[int64]int {
+	m := map[int64]int{}
+	for _, s := range seats {
+		m[s.EventID]++
+	}
+	return m
+}
+
 type CartView struct {
 	EventID    int64
 	Seats      []Seat
-	TotalCents int64
+	TotalCents int64 // net of group deal
+	DealCents  int64 // automatic adjacent-seat discount
 	Used       int64 // seats already owned + currently held for this event
 	Max        int64
 	Err        string
@@ -111,13 +173,13 @@ const offerTTL = 15 * time.Minute
 // WaitlistView is the sidebar card for a sold-out event.
 // State is "join", "waiting" or "offered"; empty means show nothing.
 type WaitlistView struct {
-	EventID      int64
-	State        string
-	Position     int64
-	Email        string
-	SeatLabel    string
-	MinutesLeft  int64
-	Err          string
+	EventID     int64
+	State       string
+	Position    int64
+	Email       string
+	SeatLabel   string
+	MinutesLeft int64
+	Err         string
 }
 
 // Promo is a percent-off discount code with optional expiry and usage cap.
@@ -150,16 +212,17 @@ func (p Promo) ExpiresLabel() string {
 }
 
 type Order struct {
-	ID            int64
-	SessionID     string
-	Name          string
-	Email         string
-	TotalCents    int64
-	DiscountCents int64
-	PromoCode     string
-	Status        string
-	RefundedAt    string
-	CreatedAt     string
+	ID                 int64
+	SessionID          string
+	Name               string
+	Email              string
+	TotalCents         int64
+	DiscountCents      int64
+	GroupDiscountCents int64
+	PromoCode          string
+	Status             string
+	RefundedAt         string
+	CreatedAt          string
 }
 
 type Ticket struct {
@@ -168,6 +231,7 @@ type Ticket struct {
 	Section  string
 	Row      string
 	Number   int64
+	Tier     string
 	EventID  int64
 	Artist   string
 	Title    string
@@ -252,15 +316,13 @@ func handleToggleSeat(w http.ResponseWriter, r *http.Request) {
 	defer tx.Rollback()
 
 	var seat Seat
-	var holder sql.NullString
-	err = tx.QueryRow(`SELECT id,event_id,section,row,number,price_cents,status,hold_session
+	err = tx.QueryRow(`SELECT id,event_id,section,row,number,price_cents,status,COALESCE(hold_session,''),tier
 		FROM seats WHERE id=? AND event_id=?`, seatID, eventID).
-		Scan(&seat.ID, &seat.EventID, &seat.Section, &seat.Row, &seat.Number, &seat.PriceCents, &seat.Status, &holder)
+		Scan(&seat.ID, &seat.EventID, &seat.Section, &seat.Row, &seat.Number, &seat.PriceCents, &seat.Status, &seat.HoldSession, &seat.Tier)
 	if err != nil {
 		http.NotFound(w, r)
 		return
 	}
-	seat.HoldSession = holder.String
 
 	seat.Viewer = sid
 	var capErr string
@@ -312,6 +374,162 @@ func handleToggleSeat(w http.ResponseWriter, r *http.Request) {
 		Seat Seat
 		Cart CartView
 	}{seat, cart})
+}
+
+// findBestBlock returns the IDs of the best block of n contiguous seats:
+// nearest the stage first (section stage_rank, then frontmost row), then the
+// window closest to the row's center. Returns nil when no row can fit n.
+func findBestBlock(eventID int64, n int) ([]int64, error) {
+	rows, err := db.Query(`SELECT id, section, row, number, status FROM seats
+		WHERE event_id=? ORDER BY stage_rank, row, number`, eventID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	type rowSeat struct {
+		id     int64
+		number int64
+		avail  bool
+	}
+	type rowGroup struct {
+		section, row string
+		seats        []rowSeat
+	}
+	var groups []rowGroup
+	for rows.Next() {
+		var s rowSeat
+		var sec, row, status string
+		if err := rows.Scan(&s.id, &sec, &row, &s.number, &status); err != nil {
+			return nil, err
+		}
+		s.avail = status == "available"
+		if len(groups) == 0 || groups[len(groups)-1].section != sec || groups[len(groups)-1].row != row {
+			groups = append(groups, rowGroup{section: sec, row: row})
+		}
+		g := &groups[len(groups)-1]
+		g.seats = append(g.seats, s)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	for _, g := range groups {
+		center := float64(g.seats[0].number+g.seats[len(g.seats)-1].number) / 2
+		bestDist, bestStart := math.Inf(1), -1
+		for i := 0; i+n <= len(g.seats); i++ {
+			win := g.seats[i : i+n]
+			ok := true
+			for j, s := range win {
+				if !s.avail || (j > 0 && s.number != win[j-1].number+1) {
+					ok = false
+					break
+				}
+			}
+			if !ok {
+				continue
+			}
+			mid := float64(win[0].number+win[n-1].number) / 2
+			if d := math.Abs(mid - center); d < bestDist {
+				bestDist, bestStart = d, i
+			}
+		}
+		if bestStart >= 0 {
+			ids := make([]int64, n)
+			for j, s := range g.seats[bestStart : bestStart+n] {
+				ids[j] = s.id
+			}
+			return ids, nil
+		}
+	}
+	return nil, nil
+}
+
+// handlePickBest holds the best available block of n seats for the session.
+func handlePickBest(w http.ResponseWriter, r *http.Request) {
+	eventID, _ := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	sid := sessionID(r)
+	n, _ := strconv.Atoi(r.FormValue("n"))
+
+	fail := func(msg string) {
+		sections, err1 := getSections(eventID, sid)
+		cart, err2 := getCart(eventID, sid)
+		if err1 != nil || err2 != nil {
+			httpErr(w, errors.Join(err1, err2))
+			return
+		}
+		cart.Err = msg
+		render(w, "clearresp.html", struct {
+			Sections []SeatSection
+			Cart     CartView
+		}{sections, cart})
+	}
+
+	if err := sweepExpiredOffers(eventID); err != nil {
+		httpErr(w, err)
+		return
+	}
+	if n < 1 {
+		fail("Pick at least 1 seat.")
+		return
+	}
+	owned, held, err := ticketUsage(eventID, sid)
+	if err != nil {
+		httpErr(w, err)
+		return
+	}
+	if left := maxTicketsPerEvent - owned - held; int64(n) > left {
+		fail(fmt.Sprintf("Only %d of your %d tickets left — release some seats or pick fewer.", left, maxTicketsPerEvent))
+		return
+	}
+	ids, err := findBestBlock(eventID, n)
+	if err != nil {
+		httpErr(w, err)
+		return
+	}
+	if ids == nil {
+		fail(fmt.Sprintf("No block of %d seats together left — try fewer or grab singles on the map.", n))
+		return
+	}
+
+	tx, err := db.Begin()
+	if err != nil {
+		httpErr(w, err)
+		return
+	}
+	defer tx.Rollback()
+	var lost bool
+	for _, id := range ids {
+		res, err := tx.Exec(`UPDATE seats SET status='held', hold_session=? WHERE id=? AND status='available'`, sid, id)
+		if err != nil {
+			httpErr(w, err)
+			return
+		}
+		if aff, _ := res.RowsAffected(); aff == 0 {
+			lost = true // someone grabbed it mid-search
+		}
+	}
+	if lost {
+		tx.Rollback()
+		fail("Those seats just got snapped up — try again!")
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		httpErr(w, err)
+		return
+	}
+	sections, err := getSections(eventID, sid)
+	if err != nil {
+		httpErr(w, err)
+		return
+	}
+	cart, err := getCart(eventID, sid)
+	if err != nil {
+		httpErr(w, err)
+		return
+	}
+	render(w, "clearresp.html", struct {
+		Sections []SeatSection
+		Cart     CartView
+	}{sections, cart})
 }
 
 func handleClearCart(w http.ResponseWriter, r *http.Request) {
@@ -373,7 +591,8 @@ type checkoutView struct {
 	Event         Event
 	Seats         []Seat
 	SubtotalCents int64
-	DiscountCents int64
+	GroupCents    int64 // automatic adjacent-seat deal
+	DiscountCents int64 // promo code discount
 	TotalCents    int64
 	PromoCode     string
 	PromoErr      string
@@ -399,6 +618,8 @@ func buildCheckoutView(sid, promoCode string) (checkoutView, error) {
 	for _, s := range seats {
 		v.SubtotalCents += s.PriceCents
 	}
+	v.GroupCents = groupDiscount(seats)
+	base := v.SubtotalCents - v.GroupCents // promos stack on the deal price
 	if promoCode != "" {
 		p, err := promoByCode(promoCode)
 		switch {
@@ -410,11 +631,11 @@ func buildCheckoutView(sid, promoCode string) (checkoutView, error) {
 			if msg := p.Validate(); msg != "" {
 				v.PromoErr = msg
 			} else {
-				v.DiscountCents = v.SubtotalCents * p.PercentOff / 100
+				v.DiscountCents = base * p.PercentOff / 100
 			}
 		}
 	}
-	v.TotalCents = v.SubtotalCents - v.DiscountCents
+	v.TotalCents = base - v.DiscountCents
 	return v, nil
 }
 
@@ -499,44 +720,47 @@ func handleCheckout(w http.ResponseWriter, r *http.Request) {
 	defer tx.Rollback()
 
 	// Confirm the seats are still held by this session before charging.
-	rows, err := tx.Query(`SELECT id, price_cents, event_id FROM seats WHERE status='held' AND hold_session=?`, sid)
+	rows, err := tx.Query(`SELECT id, event_id, section, row, number, price_cents FROM seats WHERE status='held' AND hold_session=?`, sid)
 	if err != nil {
 		httpErr(w, err)
 		return
 	}
-	var seatIDs []int64
-	var eventID int64
+	var held []Seat
 	var subtotal int64
 	for rows.Next() {
-		var id, price, ev int64
-		if err := rows.Scan(&id, &price, &ev); err != nil {
+		var s Seat
+		if err := rows.Scan(&s.ID, &s.EventID, &s.Section, &s.Row, &s.Number, &s.PriceCents); err != nil {
 			rows.Close()
 			httpErr(w, err)
 			return
 		}
-		seatIDs = append(seatIDs, id)
-		eventID = ev
-		subtotal += price
+		held = append(held, s)
+		subtotal += s.PriceCents
 	}
 	rows.Close()
-	if len(seatIDs) == 0 {
+	if len(held) == 0 {
 		http.Redirect(w, r, "/", http.StatusSeeOther)
 		return
 	}
 
-	// re-verify the per-event cap against owned tickets + this cart
-	var owned int64
-	if err := tx.QueryRow(`SELECT COUNT(*) FROM tickets t
-		JOIN orders o ON o.id = t.order_id
-		JOIN seats s ON s.id = t.seat_id
-		WHERE o.session_id = ? AND s.event_id = ?`, sid, eventID).Scan(&owned); err != nil {
-		httpErr(w, err)
-		return
+	// re-verify the per-event cap against owned tickets + this cart, per event
+	for ev, n := range countByEvent(held) {
+		var owned int64
+		if err := tx.QueryRow(`SELECT COUNT(*) FROM tickets t
+			JOIN orders o ON o.id = t.order_id
+			JOIN seats s ON s.id = t.seat_id
+			WHERE o.session_id = ? AND s.event_id = ?`, sid, ev).Scan(&owned); err != nil {
+			httpErr(w, err)
+			return
+		}
+		if owned+int64(n) > maxTicketsPerEvent {
+			fail(fmt.Sprintf("Limit of %d tickets per event — you already have %d.", maxTicketsPerEvent, owned))
+			return
+		}
 	}
-	if owned+int64(len(seatIDs)) > maxTicketsPerEvent {
-		fail(fmt.Sprintf("Limit of %d tickets per event — you already have %d.", maxTicketsPerEvent, owned))
-		return
-	}
+
+	group := groupDiscount(held)
+	base := subtotal - group // promos stack on the deal price, same as display
 
 	var discount int64
 	var appliedCode string
@@ -573,29 +797,29 @@ func handleCheckout(w http.ResponseWriter, r *http.Request) {
 			fail("That promo code has reached its usage limit.")
 			return
 		}
-		discount = subtotal * p.PercentOff / 100
+		discount = base * p.PercentOff / 100
 		appliedCode = p.Code
 	}
-	total := subtotal - discount
+	total := base - discount
 
-	res, err := tx.Exec(`INSERT INTO orders (session_id,name,email,total_cents,promo_code,discount_cents) VALUES (?,?,?,?,?,?)`,
-		sid, name, email, total, appliedCode, discount)
+	res, err := tx.Exec(`INSERT INTO orders (session_id,name,email,total_cents,promo_code,discount_cents,group_discount_cents) VALUES (?,?,?,?,?,?,?)`,
+		sid, name, email, total, appliedCode, discount, group)
 	if err != nil {
 		httpErr(w, err)
 		return
 	}
 	orderID, _ := res.LastInsertId()
 
-	for _, seatID := range seatIDs {
-		if _, err := tx.Exec(`UPDATE seats SET status='sold', hold_session=NULL WHERE id=? AND status='held' AND hold_session=?`, seatID, sid); err != nil {
+	for _, hs := range held {
+		if _, err := tx.Exec(`UPDATE seats SET status='sold', hold_session=NULL WHERE id=? AND status='held' AND hold_session=?`, hs.ID, sid); err != nil {
 			httpErr(w, err)
 			return
 		}
-		if _, err := tx.Exec(`UPDATE waitlist SET status='claimed' WHERE offered_seat_id=? AND status='offered' AND session_id=?`, seatID, sid); err != nil {
+		if _, err := tx.Exec(`UPDATE waitlist SET status='claimed' WHERE offered_seat_id=? AND status='offered' AND session_id=?`, hs.ID, sid); err != nil {
 			httpErr(w, err)
 			return
 		}
-		if _, err := tx.Exec(`INSERT INTO tickets (order_id, seat_id, code) VALUES (?,?,?)`, orderID, seatID, "TP-"+strings.ToUpper(newID(5))); err != nil {
+		if _, err := tx.Exec(`INSERT INTO tickets (order_id, seat_id, code, price_cents) VALUES (?,?,?,?)`, orderID, hs.ID, "TP-"+strings.ToUpper(newID(5)), hs.PriceCents); err != nil {
 			httpErr(w, err)
 			return
 		}
@@ -621,8 +845,8 @@ func handleOrder(w http.ResponseWriter, r *http.Request) {
 	}
 	var o Order
 	var refundedAt sql.NullString
-	err = db.QueryRow(`SELECT id,session_id,name,email,total_cents,discount_cents,promo_code,status,refunded_at,created_at FROM orders WHERE id=?`, orderID).
-		Scan(&o.ID, &o.SessionID, &o.Name, &o.Email, &o.TotalCents, &o.DiscountCents, &o.PromoCode, &o.Status, &refundedAt, &o.CreatedAt)
+	err = db.QueryRow(`SELECT id,session_id,name,email,total_cents,discount_cents,group_discount_cents,promo_code,status,refunded_at,created_at FROM orders WHERE id=?`, orderID).
+		Scan(&o.ID, &o.SessionID, &o.Name, &o.Email, &o.TotalCents, &o.DiscountCents, &o.GroupDiscountCents, &o.PromoCode, &o.Status, &refundedAt, &o.CreatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		http.NotFound(w, r)
 		return
@@ -632,7 +856,7 @@ func handleOrder(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	rows, err := db.Query(`
-		SELECT t.id, t.code, s.section, s.row, s.number,
+		SELECT t.id, t.code, s.section, s.row, s.number, s.tier,
 		       e.id, e.artist, e.title, e.venue, e.city, e.starts_at, e.gradient
 		FROM tickets t
 		JOIN seats s ON s.id = t.seat_id
@@ -647,7 +871,7 @@ func handleOrder(w http.ResponseWriter, r *http.Request) {
 	var tickets []Ticket
 	for rows.Next() {
 		var t Ticket
-		if err := rows.Scan(&t.ID, &t.Code, &t.Section, &t.Row, &t.Number,
+		if err := rows.Scan(&t.ID, &t.Code, &t.Section, &t.Row, &t.Number, &t.Tier,
 			&t.EventID, &t.Artist, &t.Title, &t.Venue, &t.City, &t.StartsAt, &t.Gradient); err != nil {
 			httpErr(w, err)
 			return
@@ -862,6 +1086,188 @@ func handleLeaveWaitlist(w http.ResponseWriter, r *http.Request) {
 	render(w, "waitlistcard.html", v)
 }
 
+// ---------- sales report ----------
+
+type reportFilters struct {
+	EventID int64
+	From    string // YYYY-MM-DD, "" = unbounded
+	To      string
+}
+
+type ReportRow struct {
+	EventID       int64
+	Artist        string
+	Title         string
+	StartsAt      string
+	Sold          int64
+	Held          int64
+	Refunded      int64
+	PromoOrders   int64
+	GrossCents    int64
+	DiscountCents int64
+	NetCents      int64
+}
+
+type reportView struct {
+	Rows   []ReportRow
+	Total  ReportRow
+	Events []Event
+	F      reportFilters
+	CSVURL string
+}
+
+func parseReportFilters(r *http.Request) reportFilters {
+	var f reportFilters
+	f.EventID, _ = strconv.ParseInt(r.URL.Query().Get("event_id"), 10, 64)
+	for _, p := range []struct {
+		name string
+		dst  *string
+	}{
+		{"from", &f.From},
+		{"to", &f.To},
+	} {
+		v := r.URL.Query().Get(p.name)
+		if _, err := time.Parse("2006-01-02", v); err == nil {
+			*p.dst = v
+		}
+	}
+	return f
+}
+
+// bounds returns the [lo, hi) RFC3339 window for the order-date filter.
+func (f reportFilters) bounds() (string, string) {
+	lo, hi := "0001-01-01T00:00:00Z", "9999-12-31T23:59:59Z"
+	if f.From != "" {
+		lo = f.From + "T00:00:00Z"
+	}
+	if f.To != "" {
+		hi = f.To + "T23:59:59Z"
+	}
+	return lo, hi
+}
+
+// buildReport computes per-event sales metrics. Order-date filters apply to
+// created_at for sold/revenue/promo metrics and refunded_at for refunds;
+// "held" is always the live count.
+func buildReport(f reportFilters) (reportView, error) {
+	rows, err := db.Query(`SELECT id,artist,title,venue,city,starts_at,description,gradient FROM events ORDER BY starts_at`)
+	if err != nil {
+		return reportView{}, err
+	}
+	var events []Event
+	for rows.Next() {
+		var e Event
+		if err := rows.Scan(&e.ID, &e.Artist, &e.Title, &e.Venue, &e.City, &e.StartsAt, &e.Description, &e.Gradient); err != nil {
+			rows.Close()
+			return reportView{}, err
+		}
+		events = append(events, e)
+	}
+	rows.Close()
+
+	lo, hi := f.bounds()
+	// Multi-event orders split their discount across seats proportionally:
+	// each seat contributes price * discount_fraction of the order's discount.
+	v := reportView{Events: events, F: f}
+	for _, e := range events {
+		if f.EventID != 0 && f.EventID != e.ID {
+			continue
+		}
+		var row ReportRow
+		row.EventID, row.Artist, row.Title, row.StartsAt = e.ID, e.Artist, e.Title, e.StartsAt
+		err := db.QueryRow(`
+			SELECT
+			  (SELECT COUNT(*) FROM seats WHERE event_id=? AND status='held'),
+			  (SELECT COUNT(*) FROM tickets t JOIN orders o ON o.id=t.order_id JOIN seats s ON s.id=t.seat_id
+			    WHERE s.event_id=? AND o.status='paid' AND o.created_at>=? AND o.created_at<=?),
+			  COALESCE((SELECT SUM(t.price_cents) FROM tickets t JOIN orders o ON o.id=t.order_id JOIN seats s ON s.id=t.seat_id
+			    WHERE s.event_id=? AND o.status='paid' AND o.created_at>=? AND o.created_at<=?),0),
+			  COALESCE((SELECT ROUND(SUM(t.price_cents * CAST(o.discount_cents+o.group_discount_cents AS REAL)/NULLIF(o.total_cents+o.discount_cents+o.group_discount_cents,0)))
+			    FROM tickets t JOIN orders o ON o.id=t.order_id JOIN seats s ON s.id=t.seat_id
+			    WHERE s.event_id=? AND o.status='paid' AND o.created_at>=? AND o.created_at<=?),0),
+			  (SELECT COUNT(*) FROM tickets t JOIN orders o ON o.id=t.order_id JOIN seats s ON s.id=t.seat_id
+			    WHERE s.event_id=? AND o.status='refunded' AND o.refunded_at>=? AND o.refunded_at<=?),
+			  (SELECT COUNT(DISTINCT o.id) FROM orders o JOIN tickets t ON t.order_id=o.id JOIN seats s ON s.id=t.seat_id
+			    WHERE s.event_id=? AND o.promo_code<>'' AND o.status='paid' AND o.created_at>=? AND o.created_at<=?)`,
+			e.ID, e.ID, lo, hi, e.ID, lo, hi, e.ID, lo, hi, e.ID, lo, hi, e.ID, lo, hi).
+			Scan(&row.Held, &row.Sold, &row.GrossCents, &row.DiscountCents, &row.Refunded, &row.PromoOrders)
+		if err != nil {
+			return reportView{}, err
+		}
+		row.NetCents = row.GrossCents - row.DiscountCents
+		v.Rows = append(v.Rows, row)
+		t := &v.Total
+		t.Sold += row.Sold
+		t.Held += row.Held
+		t.Refunded += row.Refunded
+		t.PromoOrders += row.PromoOrders
+		t.GrossCents += row.GrossCents
+		t.DiscountCents += row.DiscountCents
+		t.NetCents += row.NetCents
+	}
+	q := make(url.Values)
+	if f.EventID != 0 {
+		q.Set("event_id", strconv.FormatInt(f.EventID, 10))
+	}
+	if f.From != "" {
+		q.Set("from", f.From)
+	}
+	if f.To != "" {
+		q.Set("to", f.To)
+	}
+	v.CSVURL = "/admin/report.csv?" + q.Encode()
+	return v, nil
+}
+
+func handleAdmin(w http.ResponseWriter, r *http.Request) {
+	v, err := buildReport(parseReportFilters(r))
+	if err != nil {
+		httpErr(w, err)
+		return
+	}
+	render(w, "admin.html", v)
+}
+
+func handleAdminReport(w http.ResponseWriter, r *http.Request) {
+	v, err := buildReport(parseReportFilters(r))
+	if err != nil {
+		httpErr(w, err)
+		return
+	}
+	render(w, "report.html", v)
+}
+
+func handleAdminCSV(w http.ResponseWriter, r *http.Request) {
+	v, err := buildReport(parseReportFilters(r))
+	if err != nil {
+		httpErr(w, err)
+		return
+	}
+	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
+	w.Header().Set("Content-Disposition", `attachment; filename="sales-report.csv"`)
+	cw := csv.NewWriter(w)
+	cw.Write([]string{"event", "starts_at", "tickets_sold", "seats_held", "tickets_refunded", "promo_orders", "gross", "discounts", "net_revenue"})
+	moneyStr := func(c int64) string { return fmt.Sprintf("%.2f", float64(c)/100) }
+	for _, row := range v.Rows {
+		cw.Write([]string{
+			row.Artist + " — " + row.Title,
+			row.StartsAt,
+			strconv.FormatInt(row.Sold, 10),
+			strconv.FormatInt(row.Held, 10),
+			strconv.FormatInt(row.Refunded, 10),
+			strconv.FormatInt(row.PromoOrders, 10),
+			moneyStr(row.GrossCents),
+			moneyStr(row.DiscountCents),
+			moneyStr(row.NetCents),
+		})
+	}
+	t := v.Total
+	cw.Write([]string{"TOTAL", "", strconv.FormatInt(t.Sold, 10), strconv.FormatInt(t.Held, 10),
+		strconv.FormatInt(t.Refunded, 10), strconv.FormatInt(t.PromoOrders, 10),
+		moneyStr(t.GrossCents), moneyStr(t.DiscountCents), moneyStr(t.NetCents)})
+	cw.Flush()
+}
+
 // ---------- queries ----------
 
 func eventSoldOut(eventID int64) (bool, error) {
@@ -1016,8 +1422,8 @@ func getEvent(id int64) (Event, error) {
 }
 
 func getSections(eventID int64, sid string) ([]SeatSection, error) {
-	rows, err := db.Query(`SELECT id,event_id,section,row,number,price_cents,status,COALESCE(hold_session,'')
-		FROM seats WHERE event_id=? ORDER BY section, row, number`, eventID)
+	rows, err := db.Query(`SELECT id,event_id,section,row,number,price_cents,status,COALESCE(hold_session,''),tier
+		FROM seats WHERE event_id=? ORDER BY stage_rank, row, number`, eventID)
 	if err != nil {
 		return nil, err
 	}
@@ -1025,10 +1431,11 @@ func getSections(eventID int64, sid string) ([]SeatSection, error) {
 
 	var sections []SeatSection
 	secIdx := map[string]int{}
-	rowIdx := map[string]int{} // "section|row" -> index in section.Rows
+	tierSeen := map[string]bool{} // "section|tier" — keep first-seen tier prices
+	rowIdx := map[string]int{}    // "section|row" -> index in section.Rows
 	for rows.Next() {
 		var s Seat
-		if err := rows.Scan(&s.ID, &s.EventID, &s.Section, &s.Row, &s.Number, &s.PriceCents, &s.Status, &s.HoldSession); err != nil {
+		if err := rows.Scan(&s.ID, &s.EventID, &s.Section, &s.Row, &s.Number, &s.PriceCents, &s.Status, &s.HoldSession, &s.Tier); err != nil {
 			return nil, err
 		}
 		s.Viewer = sid
@@ -1037,6 +1444,10 @@ func getSections(eventID int64, sid string) ([]SeatSection, error) {
 			sections = append(sections, SeatSection{Name: s.Section, PriceCents: s.PriceCents})
 			si = len(sections) - 1
 			secIdx[s.Section] = si
+		}
+		if tkey := s.Section + "|" + s.Tier; !tierSeen[tkey] {
+			tierSeen[tkey] = true
+			sections[si].Tiers = append(sections[si].Tiers, SeatTier{Name: s.Tier, PriceCents: s.PriceCents})
 		}
 		key := s.Section + "|" + s.Row
 		ri, ok := rowIdx[key]
@@ -1051,8 +1462,8 @@ func getSections(eventID int64, sid string) ([]SeatSection, error) {
 }
 
 func getCart(eventID int64, sid string) (CartView, error) {
-	rows, err := db.Query(`SELECT id,event_id,section,row,number,price_cents,status,COALESCE(hold_session,'')
-		FROM seats WHERE event_id=? AND status='held' AND hold_session=? ORDER BY section,row,number`, eventID, sid)
+	rows, err := db.Query(`SELECT id,event_id,section,row,number,price_cents,status,COALESCE(hold_session,''),tier
+		FROM seats WHERE event_id=? AND status='held' AND hold_session=? ORDER BY stage_rank,row,number`, eventID, sid)
 	if err != nil {
 		return CartView{}, err
 	}
@@ -1060,7 +1471,7 @@ func getCart(eventID int64, sid string) (CartView, error) {
 	cart := CartView{EventID: eventID, Max: maxTicketsPerEvent}
 	for rows.Next() {
 		var s Seat
-		if err := rows.Scan(&s.ID, &s.EventID, &s.Section, &s.Row, &s.Number, &s.PriceCents, &s.Status, &s.HoldSession); err != nil {
+		if err := rows.Scan(&s.ID, &s.EventID, &s.Section, &s.Row, &s.Number, &s.PriceCents, &s.Status, &s.HoldSession, &s.Tier); err != nil {
 			return CartView{}, err
 		}
 		cart.Seats = append(cart.Seats, s)
@@ -1069,6 +1480,8 @@ func getCart(eventID int64, sid string) (CartView, error) {
 	if rows.Err() != nil {
 		return CartView{}, rows.Err()
 	}
+	cart.DealCents = groupDiscount(cart.Seats)
+	cart.TotalCents -= cart.DealCents
 	owned, _, err := ticketUsage(eventID, sid)
 	if err != nil {
 		return CartView{}, err
@@ -1141,10 +1554,10 @@ func ticketUsage(eventID int64, sid string) (owned, held int64, err error) {
 
 // heldSeats returns all seats this session holds, across events.
 func heldSeats(sid string) ([]Seat, error) {
-	rows, err := db.Query(`SELECT s.id,s.event_id,s.section,s.row,s.number,s.price_cents,s.status,COALESCE(s.hold_session,''),
+	rows, err := db.Query(`SELECT s.id,s.event_id,s.section,s.row,s.number,s.price_cents,s.status,COALESCE(s.hold_session,''),s.tier,
 		       e.artist || ' — ' || e.title
 		FROM seats s JOIN events e ON e.id = s.event_id
-		WHERE s.status='held' AND s.hold_session=? ORDER BY s.event_id,s.section,s.row,s.number`, sid)
+		WHERE s.status='held' AND s.hold_session=? ORDER BY s.event_id,s.stage_rank,s.row,s.number`, sid)
 	if err != nil {
 		return nil, err
 	}
@@ -1152,7 +1565,7 @@ func heldSeats(sid string) ([]Seat, error) {
 	var out []Seat
 	for rows.Next() {
 		var s Seat
-		if err := rows.Scan(&s.ID, &s.EventID, &s.Section, &s.Row, &s.Number, &s.PriceCents, &s.Status, &s.HoldSession, &s.EventName); err != nil {
+		if err := rows.Scan(&s.ID, &s.EventID, &s.Section, &s.Row, &s.Number, &s.PriceCents, &s.Status, &s.HoldSession, &s.Tier, &s.EventName); err != nil {
 			return nil, err
 		}
 		s.Viewer = sid

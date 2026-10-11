@@ -79,7 +79,153 @@ CREATE INDEX IF NOT EXISTS idx_waitlist_event ON waitlist(event_id, status);
 	if err := ensureColumn(db, "orders", "status", "TEXT NOT NULL DEFAULT 'paid'"); err != nil {
 		return err
 	}
-	return ensureColumn(db, "orders", "refunded_at", "TEXT")
+	if err := ensureColumn(db, "orders", "refunded_at", "TEXT"); err != nil {
+		return err
+	}
+	// '' marks pre-tier rows that still need backfilling
+	if err := ensureColumn(db, "seats", "tier", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if err := ensureColumn(db, "seats", "stage_rank", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
+	if err := ensureColumn(db, "tickets", "price_cents", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
+	if err := ensureColumn(db, "orders", "group_discount_cents", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
+	// snapshot what was actually paid onto each ticket — reports read this so
+	// re-pricing seats never rewrites sales history
+	if _, err := db.Exec(`UPDATE tickets SET price_cents = (SELECT price_cents FROM seats WHERE seats.id = tickets.seat_id) WHERE price_cents = 0`); err != nil {
+		return err
+	}
+	if err := backfillTiers(db); err != nil {
+		return err
+	}
+	return backfillStageRank(db)
+}
+
+// backfillStageRank orders each event's sections nearest-stage-first using
+// their top seat price as the proximity signal. Idempotent.
+func backfillStageRank(db *sql.DB) error {
+	evRows, err := db.Query(`SELECT id FROM events`)
+	if err != nil {
+		return err
+	}
+	var eventIDs []int64
+	for evRows.Next() {
+		var id int64
+		if err := evRows.Scan(&id); err != nil {
+			evRows.Close()
+			return err
+		}
+		eventIDs = append(eventIDs, id)
+	}
+	evRows.Close()
+	for _, id := range eventIDs {
+		secs, err := db.Query(`SELECT section FROM seats WHERE event_id=? GROUP BY section ORDER BY MAX(price_cents) DESC`, id)
+		if err != nil {
+			return err
+		}
+		var names []string
+		for secs.Next() {
+			var n string
+			if err := secs.Scan(&n); err != nil {
+				secs.Close()
+				return err
+			}
+			names = append(names, n)
+		}
+		secs.Close()
+		for rank, name := range names {
+			if _, err := db.Exec(`UPDATE seats SET stage_rank=? WHERE event_id=? AND section=?`, rank, id, name); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// seatTiers maps a row's position within its section to a pricing tier:
+// front third Premium, middle Standard, back third Value.
+type seatTier struct {
+	name string
+	mult float64
+}
+
+func tierForRow(rowIdx, totalRows int) seatTier {
+	premiumRows, valueRows := totalRows/3, totalRows/3
+	if premiumRows < 1 {
+		premiumRows = 1
+	}
+	if valueRows < 1 {
+		valueRows = 1
+	}
+	switch {
+	case rowIdx < premiumRows:
+		return seatTier{"Premium", 1.5}
+	case rowIdx >= totalRows-valueRows:
+		return seatTier{"Value", 0.7}
+	default:
+		return seatTier{"Standard", 1.0}
+	}
+}
+
+// backfillTiers assigns tiers to pre-tier seats and re-prices ones still on
+// sale. Sold and held seats keep their price; history lives on tickets.
+func backfillTiers(db *sql.DB) error {
+	secRows, err := db.Query(`SELECT DISTINCT event_id, section FROM seats WHERE tier = '' OR tier IS NULL`)
+	if err != nil {
+		return err
+	}
+	type sec struct {
+		eventID int64
+		name    string
+	}
+	var secs []sec
+	for secRows.Next() {
+		var s sec
+		if err := secRows.Scan(&s.eventID, &s.name); err != nil {
+			secRows.Close()
+			return err
+		}
+		secs = append(secs, s)
+	}
+	secRows.Close()
+
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, s := range secs {
+		rowLabels, err := tx.Query(`SELECT DISTINCT row FROM seats WHERE event_id=? AND section=? ORDER BY row`, s.eventID, s.name)
+		if err != nil {
+			return err
+		}
+		var labels []string
+		for rowLabels.Next() {
+			var l string
+			if err := rowLabels.Scan(&l); err != nil {
+				rowLabels.Close()
+				return err
+			}
+			labels = append(labels, l)
+		}
+		rowLabels.Close()
+		for i, l := range labels {
+			t := tierForRow(i, len(labels))
+			if _, err := tx.Exec(`UPDATE seats SET tier = ? WHERE event_id=? AND section=? AND row=?`, t.name, s.eventID, s.name, l); err != nil {
+				return err
+			}
+			if _, err := tx.Exec(`UPDATE seats SET price_cents = CAST(price_cents * ? AS INTEGER) / 100 * 100
+				WHERE event_id=? AND section=? AND row=? AND status='available'`, t.mult, s.eventID, s.name, l); err != nil {
+				return err
+			}
+		}
+	}
+	return tx.Commit()
 }
 
 func ensureColumn(db *sql.DB, table, column, def string) error {
@@ -170,7 +316,7 @@ func seed(db *sql.DB) error {
 	if err != nil {
 		return err
 	}
-	seatStmt, err := tx.Prepare(`INSERT INTO seats (event_id,section,row,number,price_cents,status) VALUES (?,?,?,?,?,?)`)
+	seatStmt, err := tx.Prepare(`INSERT INTO seats (event_id,section,row,number,price_cents,status,tier,stage_rank) VALUES (?,?,?,?,?,?,?,?)`)
 	if err != nil {
 		return err
 	}
@@ -182,15 +328,17 @@ func seed(db *sql.DB) error {
 		}
 		eventID, _ := res.LastInsertId()
 		rng := rand.New(rand.NewSource(int64(1000 + i)))
-		for _, s := range sections {
+		for si, s := range sections {
 			price := int64(float64(s.basePrice)*e.priceMult) / 100 * 100 // round to whole dollars
 			for r := 0; r < s.rows; r++ {
+				t := tierForRow(r, s.rows)
+				rowPrice := int64(float64(price)*t.mult) / 100 * 100
 				for seatNum := 1; seatNum <= s.seatsPerRow; seatNum++ {
 					status := "available"
 					if rng.Float64() < 0.15 {
 						status = "sold"
 					}
-					if _, err := seatStmt.Exec(eventID, s.name, string(rowLetters[r]), seatNum, price, status); err != nil {
+					if _, err := seatStmt.Exec(eventID, s.name, string(rowLetters[r]), seatNum, rowPrice, status, t.name, si); err != nil {
 						return err
 					}
 				}
