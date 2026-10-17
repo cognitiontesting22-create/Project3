@@ -50,10 +50,14 @@
 {{end}}
 
 {{define "report.html"}}
-<div class="grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-5">
+<div class="grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-6">
   <div class="rounded-2xl border border-white/10 bg-zinc-900/80 p-5">
     <p class="text-xs font-bold uppercase tracking-widest text-zinc-500">Net revenue</p>
     <p class="mt-2 text-2xl font-black text-emerald-400">{{money .Total.NetCents}}</p>
+  </div>
+  <div class="rounded-2xl border border-white/10 bg-zinc-900/80 p-5">
+    <p class="text-xs font-bold uppercase tracking-widest text-zinc-500">Checked in</p>
+    <p class="mt-2 text-2xl font-black text-teal-300">{{.Total.CheckedIn}}<span class="text-base font-bold text-zinc-500">/{{.Total.SoldAllTime}}</span></p>
   </div>
   <div class="rounded-2xl border border-white/10 bg-zinc-900/80 p-5">
     <p class="text-xs font-bold uppercase tracking-widest text-zinc-500">Tickets sold</p>
@@ -84,6 +88,7 @@
         <tr class="border-b border-white/10 text-left text-xs uppercase tracking-wider text-zinc-500">
           <th class="px-5 py-3 font-semibold">Event</th>
           <th class="px-4 py-3 text-right font-semibold">Sold</th>
+          <th class="px-4 py-3 text-right font-semibold">Checked in</th>
           <th class="px-4 py-3 text-right font-semibold">Held</th>
           <th class="px-4 py-3 text-right font-semibold">Refunded</th>
           <th class="px-4 py-3 text-right font-semibold">Promo</th>
@@ -98,8 +103,16 @@
           <td class="px-5 py-3.5">
             <p class="font-semibold">{{.Artist}}</p>
             <p class="text-xs text-zinc-500">{{.Title}} · {{datefmt .StartsAt}}</p>
+            {{if .CheckinCode}}
+            <p class="mt-1 text-xs text-zinc-500">Door <span class="font-mono text-zinc-400">{{.CheckinCode}}</span> ·
+              <a href="/checkin/{{.CheckinCode}}" class="font-semibold text-fuchsia-400 transition-colors hover:text-fuchsia-300">check-in page</a> ·
+              <button hx-post="/admin/events/{{.EventID}}/checkin/rotate" hx-confirm="Rotate the door code? The current check-in link stops working immediately."
+                class="underline decoration-dotted transition-colors hover:text-rose-300">rotate</button>
+            </p>
+            {{end}}
           </td>
           <td class="px-4 py-3.5 text-right font-medium">{{.Sold}}</td>
+          <td class="px-4 py-3.5 text-right text-teal-300">{{.CheckedIn}}/{{.SoldAllTime}}</td>
           <td class="px-4 py-3.5 text-right text-amber-300">{{.Held}}</td>
           <td class="px-4 py-3.5 text-right text-rose-300">{{.Refunded}}</td>
           <td class="px-4 py-3.5 text-right text-fuchsia-300">{{.PromoOrders}}</td>
@@ -113,6 +126,7 @@
         <tr class="border-t border-white/10 bg-white/[0.03] font-bold">
           <td class="px-5 py-3.5">Total</td>
           <td class="px-4 py-3.5 text-right">{{.Total.Sold}}</td>
+          <td class="px-4 py-3.5 text-right">{{.Total.CheckedIn}}/{{.Total.SoldAllTime}}</td>
           <td class="px-4 py-3.5 text-right">{{.Total.Held}}</td>
           <td class="px-4 py-3.5 text-right">{{.Total.Refunded}}</td>
           <td class="px-4 py-3.5 text-right">{{.Total.PromoOrders}}</td>

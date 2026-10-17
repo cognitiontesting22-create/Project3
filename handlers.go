@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/csv"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"html/template"
@@ -226,19 +227,20 @@ type Order struct {
 }
 
 type Ticket struct {
-	ID       int64
-	Code     string
-	Section  string
-	Row      string
-	Number   int64
-	Tier     string
-	EventID  int64
-	Artist   string
-	Title    string
-	Venue    string
-	City     string
-	StartsAt string
-	Gradient string
+	ID          int64
+	Code        string
+	Section     string
+	Row         string
+	Number      int64
+	Tier        string
+	CheckedInAt string
+	EventID     int64
+	Artist      string
+	Title       string
+	Venue       string
+	City        string
+	StartsAt    string
+	Gradient    string
 }
 
 // ---------- handlers ----------
@@ -856,7 +858,7 @@ func handleOrder(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	rows, err := db.Query(`
-		SELECT t.id, t.code, s.section, s.row, s.number, s.tier,
+		SELECT t.id, t.code, s.section, s.row, s.number, s.tier, COALESCE(t.checked_in_at,''),
 		       e.id, e.artist, e.title, e.venue, e.city, e.starts_at, e.gradient
 		FROM tickets t
 		JOIN seats s ON s.id = t.seat_id
@@ -871,7 +873,7 @@ func handleOrder(w http.ResponseWriter, r *http.Request) {
 	var tickets []Ticket
 	for rows.Next() {
 		var t Ticket
-		if err := rows.Scan(&t.ID, &t.Code, &t.Section, &t.Row, &t.Number, &t.Tier,
+		if err := rows.Scan(&t.ID, &t.Code, &t.Section, &t.Row, &t.Number, &t.Tier, &t.CheckedInAt,
 			&t.EventID, &t.Artist, &t.Title, &t.Venue, &t.City, &t.StartsAt, &t.Gradient); err != nil {
 			httpErr(w, err)
 			return
@@ -925,6 +927,12 @@ func handleRefund(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if _, err := tx.Exec(`UPDATE orders SET status='refunded', refunded_at=strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id=?`, orderID); err != nil {
+		httpErr(w, err)
+		return
+	}
+
+	// a dead ticket shouldn't carry door state — its seat may be resold
+	if _, err := tx.Exec(`UPDATE tickets SET checked_in_at=NULL, checked_in_by='' WHERE order_id=?`, orderID); err != nil {
 		httpErr(w, err)
 		return
 	}
@@ -1086,6 +1094,275 @@ func handleLeaveWaitlist(w http.ResponseWriter, r *http.Request) {
 	render(w, "waitlistcard.html", v)
 }
 
+// ---------- door check-in ----------
+//
+// Each event has a door code (events.checkin_code) the host can hand to staff.
+// The code is the whole credential: it opens /checkin/{code} and authorizes
+// scans for that event only. Rotating it kills the old link instantly.
+// Door devices are shared and sessionless — check-in deliberately ignores the
+// sid cookie.
+
+// normalizeTicketCode tolerates how door staff actually type: lowercase,
+// spaces, and a missing "TP-" prefix all resolve to the canonical code.
+func normalizeTicketCode(s string) string {
+	s = strings.ToUpper(strings.ReplaceAll(strings.TrimSpace(s), " ", ""))
+	s = strings.TrimPrefix(s, "TP-")
+	if s == "" {
+		return ""
+	}
+	return "TP-" + s
+}
+
+func eventByCheckinCode(code string) (Event, error) {
+	var e Event
+	err := db.QueryRow(`SELECT id,artist,title,venue,city,starts_at,description,gradient FROM events WHERE checkin_code=?`, code).
+		Scan(&e.ID, &e.Artist, &e.Title, &e.Venue, &e.City, &e.StartsAt, &e.Description, &e.Gradient)
+	return e, err
+}
+
+// CheckinResult is one scan outcome, rendered as a card or JSON.
+type CheckinResult struct {
+	OK          bool
+	Msg         string
+	Code        string
+	Section     string
+	Row         string
+	Number      int64
+	Holder      string
+	CheckedInAt string
+}
+
+func (r CheckinResult) SeatLabel() string { return r.Section + " · " + r.Row + strconv.FormatInt(r.Number, 10) }
+
+// checkinRespond sends the result card to htmx callers and JSON to anything
+// asking for it — a real scanner can integrate against the same endpoint.
+// Status codes are real in both modes: 200 first scan, 409 rescan, 410 void,
+// 422 wrong event, 404 unknown ticket/door code, 400 empty field.
+func checkinRespond(w http.ResponseWriter, r *http.Request, status int, res CheckinResult) {
+	if strings.Contains(r.Header.Get("Accept"), "application/json") {
+		result := "checked_in"
+		if !res.OK {
+			switch status {
+			case http.StatusConflict:
+				result = "already_checked_in"
+			case http.StatusGone:
+				result = "void"
+			case http.StatusUnprocessableEntity:
+				result = "wrong_event"
+			case http.StatusBadRequest:
+				result = "invalid"
+			default:
+				result = "not_found"
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		json.NewEncoder(w).Encode(map[string]any{
+			"result":        result,
+			"code":          res.Code,
+			"seat":          res.SeatLabel(),
+			"holder":        res.Holder,
+			"checked_in_at": res.CheckedInAt,
+			"message":       res.Msg,
+		})
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(status)
+	if err := tpl.ExecuteTemplate(w, "checkinresult.html", res); err != nil {
+		log.Printf("template checkinresult.html: %v", err)
+	}
+}
+
+func checkinResultFor(code string) (CheckinResult, error) {
+	var res CheckinResult
+	err := db.QueryRow(`SELECT t.code, COALESCE(t.checked_in_at,''), s.section, s.row, s.number, o.name
+		FROM tickets t JOIN seats s ON s.id=t.seat_id JOIN orders o ON o.id=t.order_id
+		WHERE t.code=?`, code).
+		Scan(&res.Code, &res.CheckedInAt, &res.Section, &res.Row, &res.Number, &res.Holder)
+	return res, err
+}
+
+type checkinScan struct {
+	Code        string
+	Section     string
+	Label       string
+	Holder      string
+	CheckedInAt string
+}
+
+type checkinStatus struct {
+	CheckedIn int64
+	Sold      int64
+	Recent    []checkinScan
+}
+
+// getCheckinStatus powers the door page's live counter: paid tickets scanned
+// vs paid tickets sold, plus the latest scans from every staff device.
+func getCheckinStatus(eventID int64) (checkinStatus, error) {
+	var st checkinStatus
+	err := db.QueryRow(`SELECT
+		(SELECT COUNT(*) FROM tickets t JOIN orders o ON o.id=t.order_id JOIN seats s ON s.id=t.seat_id
+		  WHERE s.event_id=? AND o.status='paid' AND t.checked_in_at IS NOT NULL),
+		(SELECT COUNT(*) FROM tickets t JOIN orders o ON o.id=t.order_id JOIN seats s ON s.id=t.seat_id
+		  WHERE s.event_id=? AND o.status='paid')`, eventID, eventID).
+		Scan(&st.CheckedIn, &st.Sold)
+	if err != nil {
+		return st, err
+	}
+	rows, err := db.Query(`SELECT t.code, s.section, s.row||s.number, o.name, t.checked_in_at
+		FROM tickets t JOIN orders o ON o.id=t.order_id JOIN seats s ON s.id=t.seat_id
+		WHERE s.event_id=? AND t.checked_in_at IS NOT NULL
+		ORDER BY t.checked_in_at DESC, t.id DESC LIMIT 8`, eventID)
+	if err != nil {
+		return st, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var sc checkinScan
+		if err := rows.Scan(&sc.Code, &sc.Section, &sc.Label, &sc.Holder, &sc.CheckedInAt); err != nil {
+			return st, err
+		}
+		st.Recent = append(st.Recent, sc)
+	}
+	return st, rows.Err()
+}
+
+func handleCheckinPage(w http.ResponseWriter, r *http.Request) {
+	door := strings.ToUpper(strings.TrimSpace(r.PathValue("doorCode")))
+	e, err := eventByCheckinCode(door)
+	if errors.Is(err, sql.ErrNoRows) {
+		http.Error(w, "This check-in link is invalid or was rotated. Ask the host for a fresh one.", http.StatusNotFound)
+		return
+	}
+	if err != nil {
+		httpErr(w, err)
+		return
+	}
+	st, err := getCheckinStatus(e.ID)
+	if err != nil {
+		httpErr(w, err)
+		return
+	}
+	// the door code lives in the URL — don't leak it to CDN/font requests
+	w.Header().Set("Referrer-Policy", "no-referrer")
+	render(w, "checkin.html", struct {
+		Event  Event
+		Door   string
+		Status checkinStatus
+	}{e, door, st})
+}
+
+// handleCheckinStatus is the door page's 5-second poll target — a fragment so
+// the live counter can refresh without stealing focus from the code input.
+func handleCheckinStatus(w http.ResponseWriter, r *http.Request) {
+	door := strings.ToUpper(strings.TrimSpace(r.PathValue("doorCode")))
+	e, err := eventByCheckinCode(door)
+	if errors.Is(err, sql.ErrNoRows) {
+		http.Error(w, "door code rotated", http.StatusNotFound)
+		return
+	}
+	if err != nil {
+		httpErr(w, err)
+		return
+	}
+	st, err := getCheckinStatus(e.ID)
+	if err != nil {
+		httpErr(w, err)
+		return
+	}
+	render(w, "checkinstatus.html", st)
+}
+
+// handleCheckinScan marks a ticket checked in. A single guarded UPDATE makes
+// the first-scan-wins rule atomic — SQLite serializes writers, so a racing
+// second scan affects 0 rows and classifies as 409.
+func handleCheckinScan(w http.ResponseWriter, r *http.Request) {
+	door := strings.ToUpper(strings.TrimSpace(r.PathValue("doorCode")))
+	e, err := eventByCheckinCode(door)
+	if errors.Is(err, sql.ErrNoRows) {
+		checkinRespond(w, r, http.StatusNotFound, CheckinResult{Msg: "This check-in link is invalid or was rotated."})
+		return
+	}
+	if err != nil {
+		httpErr(w, err)
+		return
+	}
+	code := normalizeTicketCode(r.FormValue("ticket"))
+	if code == "" {
+		checkinRespond(w, r, http.StatusBadRequest, CheckinResult{Msg: "Enter a ticket code first."})
+		return
+	}
+	res, err := db.Exec(`UPDATE tickets SET checked_in_at=strftime('%Y-%m-%dT%H:%M:%SZ','now'), checked_in_by=?
+		WHERE code=? AND checked_in_at IS NULL
+		AND seat_id IN (SELECT id FROM seats WHERE event_id=?)
+		AND order_id IN (SELECT id FROM orders WHERE status='paid')`, door, code, e.ID)
+	if err != nil {
+		httpErr(w, err)
+		return
+	}
+	if n, _ := res.RowsAffected(); n == 1 {
+		ok, err := checkinResultFor(code)
+		if err != nil {
+			httpErr(w, err)
+			return
+		}
+		ok.OK = true
+		checkinRespond(w, r, http.StatusOK, ok)
+		return
+	}
+	// 0 rows — classify in a fixed order so overlapping states (e.g. a ticket
+	// checked in then refunded) get one deterministic answer
+	var evID, number int64
+	var status, checkedAt, section, row, holder string
+	err = db.QueryRow(`SELECT s.event_id, o.status, COALESCE(t.checked_in_at,''), s.section, s.row, s.number, o.name
+		FROM tickets t JOIN seats s ON s.id=t.seat_id JOIN orders o ON o.id=t.order_id
+		WHERE t.code=?`, code).
+		Scan(&evID, &status, &checkedAt, &section, &row, &number, &holder)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		checkinRespond(w, r, http.StatusNotFound, CheckinResult{Code: code, Msg: "Unknown ticket code."})
+	case err != nil:
+		httpErr(w, err)
+	case evID != e.ID:
+		checkinRespond(w, r, http.StatusUnprocessableEntity, CheckinResult{Code: code, Msg: "That ticket is for a different event."})
+	case status != "paid":
+		checkinRespond(w, r, http.StatusGone, CheckinResult{Code: code, Msg: "That ticket was refunded — it's no longer valid."})
+	default:
+		msg := "Already checked in"
+		if t, perr := time.Parse(time.RFC3339, checkedAt); perr == nil {
+			msg += " at " + t.Format("Jan 2 · 3:04 PM")
+		}
+		checkinRespond(w, r, http.StatusConflict, CheckinResult{
+			Code: code, Section: section, Row: row, Number: number, Holder: holder,
+			CheckedInAt: checkedAt, Msg: msg,
+		})
+	}
+}
+
+// handleCheckinRotate mints a fresh door code; the old link 404s from then on.
+func handleCheckinRotate(w http.ResponseWriter, r *http.Request) {
+	eventID, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	res, err := db.Exec(`UPDATE events SET checkin_code=? WHERE id=?`, "TPK-"+strings.ToUpper(newID(8)), eventID)
+	if err != nil {
+		httpErr(w, err)
+		return
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		http.NotFound(w, r)
+		return
+	}
+	if r.Header.Get("HX-Request") == "true" {
+		w.Header().Set("HX-Redirect", "/admin")
+		return
+	}
+	http.Redirect(w, r, "/admin", http.StatusSeeOther)
+}
+
 // ---------- sales report ----------
 
 type reportFilters struct {
@@ -1106,6 +1383,9 @@ type ReportRow struct {
 	GrossCents    int64
 	DiscountCents int64
 	NetCents      int64
+	CheckedIn     int64
+	SoldAllTime   int64
+	CheckinCode   string
 }
 
 type reportView struct {
@@ -1150,17 +1430,20 @@ func (f reportFilters) bounds() (string, string) {
 // created_at for sold/revenue/promo metrics and refunded_at for refunds;
 // "held" is always the live count.
 func buildReport(f reportFilters) (reportView, error) {
-	rows, err := db.Query(`SELECT id,artist,title,venue,city,starts_at,description,gradient FROM events ORDER BY starts_at`)
+	rows, err := db.Query(`SELECT id,artist,title,venue,city,starts_at,description,gradient,checkin_code FROM events ORDER BY starts_at`)
 	if err != nil {
 		return reportView{}, err
 	}
 	var events []Event
+	doorCodes := map[int64]string{}
 	for rows.Next() {
 		var e Event
-		if err := rows.Scan(&e.ID, &e.Artist, &e.Title, &e.Venue, &e.City, &e.StartsAt, &e.Description, &e.Gradient); err != nil {
+		var door string
+		if err := rows.Scan(&e.ID, &e.Artist, &e.Title, &e.Venue, &e.City, &e.StartsAt, &e.Description, &e.Gradient, &door); err != nil {
 			rows.Close()
 			return reportView{}, err
 		}
+		doorCodes[e.ID] = door
 		events = append(events, e)
 	}
 	rows.Close()
@@ -1188,13 +1471,18 @@ func buildReport(f reportFilters) (reportView, error) {
 			  (SELECT COUNT(*) FROM tickets t JOIN orders o ON o.id=t.order_id JOIN seats s ON s.id=t.seat_id
 			    WHERE s.event_id=? AND o.status='refunded' AND o.refunded_at>=? AND o.refunded_at<=?),
 			  (SELECT COUNT(DISTINCT o.id) FROM orders o JOIN tickets t ON t.order_id=o.id JOIN seats s ON s.id=t.seat_id
-			    WHERE s.event_id=? AND o.promo_code<>'' AND o.status='paid' AND o.created_at>=? AND o.created_at<=?)`,
-			e.ID, e.ID, lo, hi, e.ID, lo, hi, e.ID, lo, hi, e.ID, lo, hi, e.ID, lo, hi).
-			Scan(&row.Held, &row.Sold, &row.GrossCents, &row.DiscountCents, &row.Refunded, &row.PromoOrders)
+			    WHERE s.event_id=? AND o.promo_code<>'' AND o.status='paid' AND o.created_at>=? AND o.created_at<=?),
+			  (SELECT COUNT(*) FROM tickets t JOIN orders o ON o.id=t.order_id JOIN seats s ON s.id=t.seat_id
+			    WHERE s.event_id=? AND o.status='paid' AND t.checked_in_at IS NOT NULL),
+			  (SELECT COUNT(*) FROM tickets t JOIN orders o ON o.id=t.order_id JOIN seats s ON s.id=t.seat_id
+			    WHERE s.event_id=? AND o.status='paid')`,
+			e.ID, e.ID, lo, hi, e.ID, lo, hi, e.ID, lo, hi, e.ID, lo, hi, e.ID, lo, hi, e.ID, e.ID).
+			Scan(&row.Held, &row.Sold, &row.GrossCents, &row.DiscountCents, &row.Refunded, &row.PromoOrders, &row.CheckedIn, &row.SoldAllTime)
 		if err != nil {
 			return reportView{}, err
 		}
 		row.NetCents = row.GrossCents - row.DiscountCents
+		row.CheckinCode = doorCodes[e.ID]
 		v.Rows = append(v.Rows, row)
 		t := &v.Total
 		t.Sold += row.Sold
@@ -1204,6 +1492,8 @@ func buildReport(f reportFilters) (reportView, error) {
 		t.GrossCents += row.GrossCents
 		t.DiscountCents += row.DiscountCents
 		t.NetCents += row.NetCents
+		t.CheckedIn += row.CheckedIn
+		t.SoldAllTime += row.SoldAllTime
 	}
 	q := make(url.Values)
 	if f.EventID != 0 {
@@ -1246,13 +1536,14 @@ func handleAdminCSV(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
 	w.Header().Set("Content-Disposition", `attachment; filename="sales-report.csv"`)
 	cw := csv.NewWriter(w)
-	cw.Write([]string{"event", "starts_at", "tickets_sold", "seats_held", "tickets_refunded", "promo_orders", "gross", "discounts", "net_revenue"})
+	cw.Write([]string{"event", "starts_at", "tickets_sold", "tickets_checked_in", "seats_held", "tickets_refunded", "promo_orders", "gross", "discounts", "net_revenue"})
 	moneyStr := func(c int64) string { return fmt.Sprintf("%.2f", float64(c)/100) }
 	for _, row := range v.Rows {
 		cw.Write([]string{
 			row.Artist + " — " + row.Title,
 			row.StartsAt,
 			strconv.FormatInt(row.Sold, 10),
+			strconv.FormatInt(row.CheckedIn, 10),
 			strconv.FormatInt(row.Held, 10),
 			strconv.FormatInt(row.Refunded, 10),
 			strconv.FormatInt(row.PromoOrders, 10),
@@ -1262,7 +1553,7 @@ func handleAdminCSV(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	t := v.Total
-	cw.Write([]string{"TOTAL", "", strconv.FormatInt(t.Sold, 10), strconv.FormatInt(t.Held, 10),
+	cw.Write([]string{"TOTAL", "", strconv.FormatInt(t.Sold, 10), strconv.FormatInt(t.CheckedIn, 10), strconv.FormatInt(t.Held, 10),
 		strconv.FormatInt(t.Refunded, 10), strconv.FormatInt(t.PromoOrders, 10),
 		moneyStr(t.GrossCents), moneyStr(t.DiscountCents), moneyStr(t.NetCents)})
 	cw.Flush()

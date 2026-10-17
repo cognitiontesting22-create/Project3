@@ -53,6 +53,10 @@ func main() {
 	mux.HandleFunc("GET /admin", handleAdmin)
 	mux.HandleFunc("GET /admin/report", handleAdminReport)
 	mux.HandleFunc("GET /admin/report.csv", handleAdminCSV)
+	mux.HandleFunc("POST /admin/events/{id}/checkin/rotate", handleCheckinRotate)
+	mux.HandleFunc("GET /checkin/{doorCode}", handleCheckinPage)
+	mux.HandleFunc("POST /checkin/{doorCode}", handleCheckinScan)
+	mux.HandleFunc("GET /checkin/{doorCode}/status", handleCheckinStatus)
 	mux.Handle("GET /static/", http.FileServerFS(assets))
 
 	addr := ":8080"
@@ -72,6 +76,12 @@ func parseTemplates() *template.Template {
 			return t.Format("Mon, Jan 2 · 3:04 PM")
 		},
 		"div2": func(n int) int { return n / 2 },
+		"pct": func(a, b int64) int64 {
+			if b <= 0 {
+				return 0
+			}
+			return a * 100 / b
+		},
 		"seq": func(lo, hi int) []int {
 			out := make([]int, 0, hi-lo+1)
 			for i := lo; i <= hi; i++ {

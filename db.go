@@ -3,6 +3,7 @@ package main
 import (
 	"database/sql"
 	"math/rand"
+	"strings"
 )
 
 func migrate(db *sql.DB) error {
@@ -95,15 +96,60 @@ CREATE INDEX IF NOT EXISTS idx_waitlist_event ON waitlist(event_id, status);
 	if err := ensureColumn(db, "orders", "group_discount_cents", "INTEGER NOT NULL DEFAULT 0"); err != nil {
 		return err
 	}
+	if err := ensureColumn(db, "tickets", "checked_in_at", "TEXT"); err != nil {
+		return err
+	}
+	// audit only — records which door credential scanned the ticket; never
+	// rendered back to clients
+	if err := ensureColumn(db, "tickets", "checked_in_by", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	// '' marks events that still need a door code generated
+	if err := ensureColumn(db, "events", "checkin_code", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
 	// snapshot what was actually paid onto each ticket — reports read this so
 	// re-pricing seats never rewrites sales history
 	if _, err := db.Exec(`UPDATE tickets SET price_cents = (SELECT price_cents FROM seats WHERE seats.id = tickets.seat_id) WHERE price_cents = 0`); err != nil {
+		return err
+	}
+	if err := backfillCheckinCodes(db); err != nil {
+		return err
+	}
+	// partial index: '' means "no code yet" and must not collide across rows.
+	// Runs after the backfill so existing DBs never present duplicate ''s.
+	if _, err := db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_events_checkin ON events(checkin_code) WHERE checkin_code <> ''`); err != nil {
 		return err
 	}
 	if err := backfillTiers(db); err != nil {
 		return err
 	}
 	return backfillStageRank(db)
+}
+
+// backfillCheckinCodes gives every event a door code — the shareable
+// credential that opens the /checkin scanner page for that event. Idempotent.
+func backfillCheckinCodes(db *sql.DB) error {
+	rows, err := db.Query(`SELECT id FROM events WHERE checkin_code = '' OR checkin_code IS NULL`)
+	if err != nil {
+		return err
+	}
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return err
+		}
+		ids = append(ids, id)
+	}
+	rows.Close()
+	for _, id := range ids {
+		if _, err := db.Exec(`UPDATE events SET checkin_code=? WHERE id=?`, "TPK-"+strings.ToUpper(newID(8)), id); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // backfillStageRank orders each event's sections nearest-stage-first using
@@ -312,7 +358,7 @@ func seed(db *sql.DB) error {
 	}
 	defer tx.Rollback()
 
-	evStmt, err := tx.Prepare(`INSERT INTO events (artist,title,venue,city,starts_at,description,gradient) VALUES (?,?,?,?,?,?,?)`)
+	evStmt, err := tx.Prepare(`INSERT INTO events (artist,title,venue,city,starts_at,description,gradient,checkin_code) VALUES (?,?,?,?,?,?,?,?)`)
 	if err != nil {
 		return err
 	}
@@ -322,7 +368,7 @@ func seed(db *sql.DB) error {
 	}
 
 	for i, e := range events {
-		res, err := evStmt.Exec(e.artist, e.title, e.venue, e.city, e.startsAt, e.desc, e.gradient)
+		res, err := evStmt.Exec(e.artist, e.title, e.venue, e.city, e.startsAt, e.desc, e.gradient, "TPK-"+strings.ToUpper(newID(8)))
 		if err != nil {
 			return err
 		}
