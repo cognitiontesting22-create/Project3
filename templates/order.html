@@ -56,6 +56,9 @@
       <div class="ticket-stub relative flex w-44 shrink-0 flex-col items-center justify-center gap-2 border-l-2 border-dashed border-white/15 bg-zinc-950/60 p-5">
         <div class="h-24 w-24 rounded-lg bg-white p-1.5">{{qr .Code}}</div>
         <p class="font-mono text-xs font-bold tracking-widest text-zinc-300">{{.Code}}</p>
+        {{if .CheckedInAt}}
+        <p class="rounded-md bg-emerald-500/15 px-2 py-0.5 text-[10px] font-bold uppercase tracking-widest text-emerald-400">✓ Checked in</p>
+        {{end}}
       </div>
     </div>
     {{end}}

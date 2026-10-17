@@ -2,6 +2,7 @@ package main
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -508,6 +509,274 @@ func TestReportNumbers(t *testing.T) {
 	// discounts = promo + group attributed across the order's seats
 	if row.DiscountCents <= 0 {
 		t.Error("expected attributed discounts > 0")
+	}
+}
+
+// ---------- door check-in ----------
+
+func TestDoorCodesSeeded(t *testing.T) {
+	setup(t)
+	if n := queryInt(t, `SELECT COUNT(*) FROM events WHERE checkin_code='' OR checkin_code IS NULL`); n != 0 {
+		t.Fatalf("%d events missing door codes", n)
+	}
+	if n := queryInt(t, `SELECT COUNT(*) FROM (SELECT checkin_code FROM events WHERE checkin_code<>'' GROUP BY checkin_code HAVING COUNT(*)>1)`); n != 0 {
+		t.Fatal("duplicate door codes")
+	}
+	// an event inserted without a code (the '' sentinel) must not collide
+	if _, err := db.Exec(`INSERT INTO events (artist,title,venue,city,starts_at,description,gradient)
+		VALUES ('X','X','V','C','2030-01-01T20:00:00Z','','g')`); err != nil {
+		t.Fatalf("uncoded event insert rejected: %v", err)
+	}
+}
+
+// buyTicket purchases one available seat on event 1 and returns its order and
+// ticket code.
+func buyTicket(t *testing.T, sid string) (orderID int64, code string) {
+	t.Helper()
+	seatID := queryInt(t, `SELECT id FROM seats WHERE event_id=1 AND status='available' LIMIT 1`)
+	holdSeat(t, seatID, sid)
+	do(t, "POST /checkout", handleCheckout, "POST", "/checkout", sid, url.Values{
+		"name": {"B"}, "email": {"b@x.com"}, "card": {"4242424242424242"},
+	})
+	// newest ticket on the seat — a resold seat carries older refunded tickets
+	return queryInt(t, `SELECT order_id FROM tickets WHERE seat_id=? ORDER BY id DESC LIMIT 1`, seatID),
+		queryStr(t, `SELECT code FROM tickets WHERE seat_id=? ORDER BY id DESC LIMIT 1`, seatID)
+}
+
+func scan(t *testing.T, door, ticket string) *httptest.ResponseRecorder {
+	t.Helper()
+	return do(t, "POST /checkin/{doorCode}", handleCheckinScan, "POST", "/checkin/"+door, "staff", url.Values{"ticket": {ticket}})
+}
+
+func TestCheckinScan(t *testing.T) {
+	setup(t)
+	door := queryStr(t, `SELECT checkin_code FROM events WHERE id=1`)
+	_, code := buyTicket(t, "buyer1")
+
+	rec := scan(t, door, code)
+	if rec.Code != 200 {
+		t.Fatalf("first scan: %d %q", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "Checked in") {
+		t.Errorf("expected success card, got %q", rec.Body.String())
+	}
+	at := queryStr(t, `SELECT COALESCE(checked_in_at,'') FROM tickets WHERE code=?`, code)
+	if at == "" {
+		t.Fatal("checked_in_at not set")
+	}
+	if by := queryStr(t, `SELECT checked_in_by FROM tickets WHERE code=?`, code); by != door {
+		t.Errorf("checked_in_by: got %q, want %q", by, door)
+	}
+
+	rec = scan(t, door, code)
+	if rec.Code != 409 {
+		t.Fatalf("second scan should be 409, got %d", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "Already checked in") {
+		t.Errorf("409 body should explain itself, got %q", rec.Body.String())
+	}
+	if at2 := queryStr(t, `SELECT checked_in_at FROM tickets WHERE code=?`, code); at2 != at {
+		t.Error("rescan clobbered checked_in_at")
+	}
+}
+
+func TestCheckinScanErrors(t *testing.T) {
+	setup(t)
+	door := queryStr(t, `SELECT checkin_code FROM events WHERE id=1`)
+
+	if rec := scan(t, door, "TP-DEADBEEF00"); rec.Code != 404 {
+		t.Errorf("unknown ticket: got %d, want 404", rec.Code)
+	}
+	if rec := scan(t, door, "  "); rec.Code != 400 {
+		t.Errorf("empty ticket: got %d, want 400", rec.Code)
+	}
+	if rec := scan(t, "TPK-NOSUCHCODE00", "TP-ABC123"); rec.Code != 404 {
+		t.Errorf("bad door code: got %d, want 404", rec.Code)
+	}
+
+	// a ticket for event 2 scanned at event 1's door
+	seat2 := queryInt(t, `SELECT id FROM seats WHERE event_id=2 AND status='available' LIMIT 1`)
+	holdSeat(t, seat2, "ev2")
+	do(t, "POST /checkout", handleCheckout, "POST", "/checkout", "ev2", url.Values{
+		"name": {"W"}, "email": {"w@x.com"}, "card": {"4242424242424242"},
+	})
+	code2 := queryStr(t, `SELECT code FROM tickets WHERE seat_id=?`, seat2)
+	if rec := scan(t, door, code2); rec.Code != 422 {
+		t.Errorf("wrong-event ticket: got %d, want 422", rec.Code)
+	}
+
+	// a refunded ticket is void, not "already scanned"
+	oid, code := buyTicket(t, "refunder")
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /orders/{id}/refund", handleRefund)
+	req := httptest.NewRequest("POST", fmt.Sprintf("/orders/%d/refund", oid), nil)
+	req = req.WithContext(withSession(req.Context(), "refunder"))
+	mux.ServeHTTP(httptest.NewRecorder(), req)
+	if rec := scan(t, door, code); rec.Code != 410 {
+		t.Errorf("refunded ticket: got %d, want 410", rec.Code)
+	}
+
+	// typed the way door staff type it: lowercase, no prefix, stray spaces
+	_, code3 := buyTicket(t, "typist")
+	mangled := " " + strings.ToLower(strings.TrimPrefix(code3, "TP-"))
+	if rec := scan(t, door, mangled); rec.Code != 200 {
+		t.Errorf("normalized scan: got %d %q, want 200", rec.Code, rec.Body.String())
+	}
+}
+
+func TestCheckinRefundResell(t *testing.T) {
+	setup(t)
+	door := queryStr(t, `SELECT checkin_code FROM events WHERE id=1`)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /orders/{id}/refund", handleRefund)
+
+	oid, code := buyTicket(t, "first")
+	seatID := queryInt(t, `SELECT seat_id FROM tickets WHERE code=?`, code)
+	if rec := scan(t, door, code); rec.Code != 200 {
+		t.Fatalf("first scan: %d", rec.Code)
+	}
+
+	req := httptest.NewRequest("POST", fmt.Sprintf("/orders/%d/refund", oid), nil)
+	req = req.WithContext(withSession(req.Context(), "first"))
+	mux.ServeHTTP(httptest.NewRecorder(), req)
+	if at := queryStr(t, `SELECT COALESCE(checked_in_at,'') FROM tickets WHERE code=?`, code); at != "" {
+		t.Error("refund should clear checked_in_at")
+	}
+
+	// the freed seat sells again and its new ticket scans cleanly
+	holdSeat(t, seatID, "second")
+	do(t, "POST /checkout", handleCheckout, "POST", "/checkout", "second", url.Values{
+		"name": {"S"}, "email": {"s@x.com"}, "card": {"4242424242424242"},
+	})
+	code2 := queryStr(t, `SELECT code FROM tickets WHERE seat_id=? ORDER BY id DESC LIMIT 1`, seatID)
+	if code2 == code {
+		t.Fatal("resold seat reused the old ticket")
+	}
+	if rec := scan(t, door, code2); rec.Code != 200 {
+		t.Fatalf("resold ticket scan: %d", rec.Code)
+	}
+	if rec := scan(t, door, code); rec.Code != 410 {
+		t.Errorf("old ticket should be void, got %d", rec.Code)
+	}
+
+	v, err := buildReport(reportFilters{EventID: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	row := v.Rows[0]
+	if row.Sold != 1 || row.CheckedIn != 1 || row.SoldAllTime != 1 {
+		t.Fatalf("report: sold=%d checkedin=%d soldall=%d, want 1/1/1", row.Sold, row.CheckedIn, row.SoldAllTime)
+	}
+}
+
+func TestCheckinJSON(t *testing.T) {
+	setup(t)
+	door := queryStr(t, `SELECT checkin_code FROM events WHERE id=1`)
+	_, code := buyTicket(t, "json")
+
+	post := func() *httptest.ResponseRecorder {
+		req := httptest.NewRequest("POST", "/checkin/"+door, strings.NewReader(url.Values{"ticket": {code}}.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req.Header.Set("Accept", "application/json")
+		rec := httptest.NewRecorder()
+		mux := http.NewServeMux()
+		mux.HandleFunc("POST /checkin/{doorCode}", handleCheckinScan)
+		mux.ServeHTTP(rec, req)
+		return rec
+	}
+
+	rec := post()
+	if rec.Code != 200 {
+		t.Fatalf("json scan: %d", rec.Code)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("not json: %v", err)
+	}
+	if body["result"] != "checked_in" || body["code"] != code {
+		t.Errorf("unexpected json: %v", body)
+	}
+
+	rec = post()
+	if rec.Code != 409 {
+		t.Fatalf("json rescan: %d, want 409", rec.Code)
+	}
+	json.Unmarshal(rec.Body.Bytes(), &body)
+	if body["result"] != "already_checked_in" {
+		t.Errorf("rescan result: %v", body["result"])
+	}
+	if _, leaked := body["checked_in_by"]; leaked {
+		t.Error("response leaks the door credential")
+	}
+}
+
+func TestCheckinRotate(t *testing.T) {
+	setup(t)
+	old := queryStr(t, `SELECT checkin_code FROM events WHERE id=1`)
+	rec := do(t, "POST /admin/events/{id}/checkin/rotate", handleCheckinRotate, "POST", "/admin/events/1/checkin/rotate", "admin", nil)
+	if rec.Header().Get("HX-Redirect") == "" && rec.Code != 303 {
+		t.Fatalf("rotate should redirect, got %d", rec.Code)
+	}
+	if cur := queryStr(t, `SELECT checkin_code FROM events WHERE id=1`); cur == old || cur == "" {
+		t.Fatalf("code not rotated: %q", cur)
+	}
+	if rec := scan(t, old, "TP-ABC123"); rec.Code != 404 {
+		t.Errorf("dead door code should 404, got %d", rec.Code)
+	}
+}
+
+func TestCheckinDoorPage(t *testing.T) {
+	setup(t)
+	door := queryStr(t, `SELECT checkin_code FROM events WHERE id=1`)
+	_, code := buyTicket(t, "doorgoer")
+	scan(t, door, code)
+
+	rec := do(t, "GET /checkin/{doorCode}", handleCheckinPage, "GET", "/checkin/"+door, "staff", nil)
+	if rec.Code != 200 {
+		t.Fatalf("door page: %d", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "/checkin/"+door+"/status") {
+		t.Error("door page missing its status poll")
+	}
+
+	rec = do(t, "GET /checkin/{doorCode}/status", handleCheckinStatus, "GET", "/checkin/"+door+"/status", "staff", nil)
+	if rec.Code != 200 {
+		t.Fatalf("status fragment: %d", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "1</span>") || !strings.Contains(rec.Body.String(), "/ 1") {
+		t.Errorf("status should show 1 of 1 checked in, got %q", rec.Body.String())
+	}
+
+	rec = do(t, "GET /checkin/{doorCode}", handleCheckinPage, "GET", "/checkin/TPK-GONE", "staff", nil)
+	if rec.Code != 404 {
+		t.Errorf("dead door link: got %d, want 404", rec.Code)
+	}
+}
+
+func TestCheckinCSVColumn(t *testing.T) {
+	setup(t)
+	door := queryStr(t, `SELECT checkin_code FROM events WHERE id=1`)
+	_, code := buyTicket(t, "csvbuyer")
+	scan(t, door, code)
+
+	rec := do(t, "GET /admin/report.csv", handleAdminCSV, "GET", "/admin/report.csv", "", nil)
+	lines := strings.Split(strings.TrimSpace(rec.Body.String()), "\n")
+	if len(lines) < 2 {
+		t.Fatalf("csv too short: %q", rec.Body.String())
+	}
+	head := strings.Split(lines[0], ",")
+	var ci int
+	for i, h := range head {
+		if h == "tickets_checked_in" {
+			ci = i
+		}
+	}
+	// every row must carry the new column — a misaligned total row would
+	// leave it empty or shifted
+	for _, ln := range lines[1:] {
+		if got := strings.Split(ln, ",")[ci]; got == "" {
+			t.Errorf("missing checked_in cell in %q", ln)
+		}
 	}
 }
 
