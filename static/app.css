@@ -111,3 +111,6 @@
 ::selection {
   background: rgba(217, 70, 239, 0.4);
 }
+
+.seat-resale{background:#0d9488;box-shadow:0 0 6px rgba(20,184,166,.5);cursor:pointer}
+.seat-resale:hover{background:#14b8a6}

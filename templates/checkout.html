@@ -89,10 +89,10 @@
     {{range .Seats}}
     <li class="flex items-center justify-between rounded-lg bg-white/5 px-3 py-2 text-sm">
       <div>
-        <p class="font-medium">{{.Section}} · {{.Label}} <span class="text-xs font-normal text-zinc-500">{{.Tier}}</span></p>
+        <p class="font-medium">{{.Section}} · {{.Label}} <span class="text-xs font-normal text-zinc-500">{{if .ResaleCents}}Resale{{else}}{{.Tier}}{{end}}</span></p>
         <p class="text-xs text-zinc-500">{{.EventName}}</p>
       </div>
-      <span class="text-zinc-400">{{money .PriceCents}}</span>
+      <span class="text-zinc-400">{{money .CartCents}}</span>
     </li>
     {{end}}
   </ul>
@@ -110,6 +110,7 @@
     <p class="text-xs font-medium text-emerald-400">Promo applied</p>
     {{end}}
     <div class="flex justify-between pt-1 text-lg font-extrabold"><span>Total</span><span>{{money .TotalCents}}</span></div>
+    {{if .HasResale}}<p class="pt-1 text-xs text-zinc-500">Promo codes and group deals do not apply to resale seats.</p>{{end}}
   </div>
 </aside>
 {{end}}

@@ -1,0 +1,62 @@
+{{define "ticket.html"}}
+{{template "head" "Ticket"}}
+<body class="min-h-screen bg-zinc-950 text-zinc-100">
+  <main class="mx-auto max-w-md px-6 py-14">
+    <p class="text-xs font-bold uppercase tracking-widest text-fuchsia-400">{{.T.Title}}</p>
+    <h1 class="mt-1 text-3xl font-black tracking-tight">{{.T.Artist}}</h1>
+    <p class="mt-1 text-sm text-zinc-400">{{.T.Venue}} · {{.T.City}} · {{datefmt .T.StartsAt}}</p>
+
+    <div class="ticket mt-8 flex overflow-hidden rounded-2xl border border-white/10 bg-zinc-900">
+      <div class="flex-1 p-6">
+        <div class="flex flex-wrap items-end gap-x-10 gap-y-3">
+          <div><p class="text-[10px] font-bold uppercase tracking-widest text-zinc-500">Section</p><p class="text-lg font-bold">{{.T.Section}}</p></div>
+          <div><p class="text-[10px] font-bold uppercase tracking-widest text-zinc-500">Row</p><p class="text-lg font-bold">{{.T.Row}}</p></div>
+          <div><p class="text-[10px] font-bold uppercase tracking-widest text-zinc-500">Seat</p><p class="text-lg font-bold">{{.T.Number}}</p></div>
+        </div>
+        <p class="mt-5 text-sm text-zinc-400">Held by <span class="font-semibold text-zinc-200">{{.T.HolderName}}</span></p>
+        {{if .T.CheckedInAt}}<p class="mt-2 inline-block rounded-md bg-emerald-500/15 px-2 py-0.5 text-[10px] font-bold uppercase tracking-widest text-emerald-400">✓ Checked in</p>{{end}}
+        {{if .Listed}}<p class="mt-3 text-sm font-semibold text-teal-300">Listed for resale at {{money .T.ListedCents}}</p>{{end}}
+      </div>
+      <div class="ticket-stub relative flex w-40 shrink-0 flex-col items-center justify-center gap-2 border-l-2 border-dashed border-white/15 bg-zinc-950/60 p-5">
+        <div class="h-24 w-24 rounded-lg bg-white p-1.5">{{qr .T.Code}}</div>
+        <p class="font-mono text-xs font-bold tracking-widest text-zinc-300">{{.T.Code}}</p>
+      </div>
+    </div>
+
+    <section class="mt-8 rounded-2xl border border-white/10 bg-zinc-900/80 p-6">
+      <h2 class="text-sm font-bold uppercase tracking-widest text-zinc-400">Holder history</h2>
+      <ol class="mt-3 list-decimal space-y-1.5 pl-5 text-sm">
+        {{range $i, $h := .Holders}}
+        <li>{{$h.Name}} <span class="text-xs text-zinc-500">{{$h.Email}}</span>{{if eq $i (sub (len $.Holders) 1)}} <span class="ml-1 rounded-full bg-fuchsia-500/15 px-2 py-0.5 text-[10px] font-bold uppercase tracking-widest text-fuchsia-300">current holder</span>{{end}}</li>
+        {{end}}
+      </ol>
+    </section>
+
+    {{if .Listed}}
+    <form method="post" action="/tickets/{{.T.Code}}/delist" class="mt-6">
+      <button class="w-full rounded-xl border border-white/10 px-4 py-3 text-sm font-bold text-zinc-300 transition-colors hover:border-rose-500/40 hover:text-rose-300">Delist</button>
+    </form>
+    {{else}}
+    <section class="mt-6 rounded-2xl border border-white/10 bg-zinc-900/80 p-6">
+      <h2 class="text-sm font-bold uppercase tracking-widest text-zinc-400">Transfer</h2>
+      {{if .CanTransfer}}
+      <form method="post" action="/tickets/{{.T.Code}}/transfer" class="mt-3 flex gap-2">
+        <input name="name" required placeholder="New holder name" class="w-full rounded-lg border border-white/10 bg-zinc-950 px-3 py-2 text-sm outline-none focus:border-fuchsia-500" />
+        <input name="email" type="email" required placeholder="email" class="w-full rounded-lg border border-white/10 bg-zinc-950 px-3 py-2 text-sm outline-none focus:border-fuchsia-500" />
+        <button class="shrink-0 rounded-lg bg-fuchsia-600 px-4 py-2 text-sm font-bold">Transfer</button>
+      </form>
+      {{else}}<p class="mt-3 text-sm text-zinc-400">{{.TransferNote}}</p>{{end}}
+    </section>
+    <section class="mt-4 rounded-2xl border border-white/10 bg-zinc-900/80 p-6">
+      <h2 class="text-sm font-bold uppercase tracking-widest text-zinc-400">Sell on resale</h2>
+      {{if .CanList}}
+      <form method="post" action="/tickets/{{.T.Code}}/list" class="mt-3 flex gap-2">
+        <input name="price" required placeholder="120.00" class="w-full rounded-lg border border-white/10 bg-zinc-950 px-3 py-2 text-sm outline-none focus:border-fuchsia-500" />
+        <button class="shrink-0 rounded-lg border border-teal-500/40 px-4 py-2 text-sm font-bold text-teal-300">List</button>
+      </form>
+      {{else}}<p class="mt-3 text-sm text-zinc-400">{{.ListNote}}</p>{{end}}
+    </section>
+    {{end}}
+  </main>
+</body>
+{{end}}

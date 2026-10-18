@@ -65,7 +65,30 @@ CREATE TABLE IF NOT EXISTS waitlist (
 CREATE INDEX IF NOT EXISTS idx_seats_event ON seats(event_id);
 CREATE INDEX IF NOT EXISTS idx_seats_hold ON seats(hold_session);
 CREATE INDEX IF NOT EXISTS idx_tickets_order ON tickets(order_id);
+CREATE TABLE IF NOT EXISTS transfers (
+  id          INTEGER PRIMARY KEY,
+  ticket_id   INTEGER NOT NULL REFERENCES tickets(id),
+  old_code    TEXT NOT NULL,
+  new_code    TEXT NOT NULL,
+  holder_name  TEXT NOT NULL,
+  holder_email TEXT NOT NULL,
+  created_at  TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS resales (
+  id              INTEGER PRIMARY KEY,
+  ticket_id       INTEGER NOT NULL REFERENCES tickets(id),
+  event_id        INTEGER NOT NULL REFERENCES events(id),
+  seller_order_id INTEGER NOT NULL REFERENCES orders(id),
+  buyer_order_id  INTEGER NOT NULL REFERENCES orders(id),
+  price_cents     INTEGER NOT NULL,
+  fee_cents       INTEGER NOT NULL,
+  payout_cents    INTEGER NOT NULL,
+  created_at      TEXT NOT NULL
+);
 CREATE INDEX IF NOT EXISTS idx_waitlist_event ON waitlist(event_id, status);
+CREATE INDEX IF NOT EXISTS idx_transfers_old_code ON transfers(old_code);
+CREATE INDEX IF NOT EXISTS idx_transfers_ticket ON transfers(ticket_id);
+CREATE INDEX IF NOT EXISTS idx_resales_event ON resales(event_id, created_at);
 `)
 	if err != nil {
 		return err
@@ -106,6 +129,28 @@ CREATE INDEX IF NOT EXISTS idx_waitlist_event ON waitlist(event_id, status);
 	}
 	// '' marks events that still need a door code generated
 	if err := ensureColumn(db, "events", "checkin_code", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	// '' means the holder is still the order's buyer
+	if err := ensureColumn(db, "tickets", "holder_name", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if err := ensureColumn(db, "tickets", "holder_email", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	// 0 = not listed for resale
+	if err := ensureColumn(db, "tickets", "listing_price_cents", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
+	// 1 = this code died when the seat was resold; resale_price_cents is what the buyer paid
+	if err := ensureColumn(db, "tickets", "resold", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
+	if err := ensureColumn(db, "tickets", "resale_price_cents", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
+	// 'resale' marks tickets bought on resale — they never count in venue sales
+	if err := ensureColumn(db, "tickets", "kind", "TEXT NOT NULL DEFAULT ''"); err != nil {
 		return err
 	}
 	// snapshot what was actually paid onto each ticket — reports read this so

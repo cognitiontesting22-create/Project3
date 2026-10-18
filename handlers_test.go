@@ -800,3 +800,463 @@ func TestSessionMiddleware(t *testing.T) {
 		t.Error("sid cookie not set")
 	}
 }
+
+// ---------- transfers & resale ----------
+
+func getJSON(t *testing.T, target string) (int, map[string]any) {
+	t.Helper()
+	req := httptest.NewRequest("GET", "/tickets/"+target, nil)
+	req.Header.Set("Accept", "application/json")
+	rec := httptest.NewRecorder()
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /tickets/{code}", handleTicketPage)
+	mux.ServeHTTP(rec, req)
+	var m map[string]any
+	json.NewDecoder(rec.Body).Decode(&m)
+	return rec.Code, m
+}
+
+func transferReq(t *testing.T, code, name, email string) *httptest.ResponseRecorder {
+	t.Helper()
+	return do(t, "POST /tickets/{code}/transfer", handleTicketTransfer, "POST", "/tickets/"+code+"/transfer", "s1",
+		url.Values{"name": {name}, "email": {email}})
+}
+
+func listReq(t *testing.T, code, price string) *httptest.ResponseRecorder {
+	t.Helper()
+	return do(t, "POST /tickets/{code}/list", handleTicketList, "POST", "/tickets/"+code+"/list", "s1",
+		url.Values{"price": {price}})
+}
+
+func delistReq(t *testing.T, code string) *httptest.ResponseRecorder {
+	t.Helper()
+	return do(t, "POST /tickets/{code}/delist", handleTicketDelist, "POST", "/tickets/"+code+"/delist", "s1", nil)
+}
+
+func doorCode(t *testing.T) string {
+	t.Helper()
+	return queryStr(t, `SELECT checkin_code FROM events WHERE id=1`)
+}
+
+func TestTransfer(t *testing.T) {
+	setup(t)
+	_, code := buyTicket(t, "s1")
+	rec := transferReq(t, code, "Dana Lee", "dana@example.com")
+	if rec.Code != 200 || rec.Header().Get("HX-Redirect") == "" {
+		t.Fatalf("transfer: %d %q", rec.Code, rec.Body.String())
+	}
+	newCode := rec.Header().Get("HX-Redirect")[len("/tickets/"):]
+	st, m := getJSON(t, newCode)
+	if st != 200 || m["holder_name"] != "Dana Lee" || m["holder_email"] != "dana@example.com" || m["transfers"].(float64) != 1 {
+		t.Fatalf("new code json: %d %v", st, m)
+	}
+	st, m = getJSON(t, code)
+	if st != 410 || m["status"] != "transferred" || m["message"] != "This ticket was transferred to Dana Lee." {
+		t.Fatalf("old code json: %d %v", st, m)
+	}
+	rec = scan(t, doorCode(t), code)
+	if rec.Code != 410 || !strings.Contains(rec.Body.String(), "transferred to Dana Lee") {
+		t.Fatalf("old code at door: %d %q", rec.Code, rec.Body.String())
+	}
+	if rec := scan(t, doorCode(t), newCode); rec.Code != 200 || !strings.Contains(rec.Body.String(), "Dana Lee") {
+		t.Fatalf("new code at door: %d %q", rec.Code, rec.Body.String())
+	}
+	if rec := scan(t, doorCode(t), newCode); rec.Code != 409 {
+		t.Fatalf("rescan: %d", rec.Code)
+	}
+}
+
+func TestTransferValidation(t *testing.T) {
+	setup(t)
+	_, code := buyTicket(t, "s1")
+	for _, f := range [][2]string{{"", "d@x.com"}, {"D", "nope"}} {
+		if rec := transferReq(t, code, f[0], f[1]); rec.Code != 422 || !strings.Contains(rec.Body.String(), "Enter a name and a valid email address") {
+			t.Fatalf("validate %v: %d %q", f, rec.Code, rec.Body.String())
+		}
+	}
+	if rec := transferReq(t, code, "X", " B@X.COM "); rec.Code != 422 || !strings.Contains(rec.Body.String(), "already belongs") {
+		t.Fatalf("same email: %d %q", rec.Code, rec.Body.String())
+	}
+	if st, _ := getJSON(t, code); st != 200 {
+		t.Fatalf("refused transfer changed ticket")
+	}
+}
+
+func TestTransferRefusals(t *testing.T) {
+	setup(t)
+	door := doorCode(t)
+	oid, code := buyTicket(t, "s1")
+	scan(t, door, code)
+	if rec := transferReq(t, code, "D", "d@x.com"); rec.Code != 409 || !strings.Contains(rec.Body.String(), "already been checked in") {
+		t.Fatalf("checked-in transfer: %d %q", rec.Code, rec.Body.String())
+	}
+	do(t, "POST /orders/{id}/refund", handleRefund, "POST", fmt.Sprintf("/orders/%d/refund", oid), "s1", nil)
+	if rec := transferReq(t, code, "D", "d@x.com"); rec.Code != 410 || !strings.Contains(rec.Body.String(), "refunded and cannot be transferred") {
+		t.Fatalf("refunded transfer: %d %q", rec.Code, rec.Body.String())
+	}
+	_, c2 := buyTicket(t, "s1")
+	r := transferReq(t, c2, "Dana", "d@x.com")
+	c3 := r.Header().Get("HX-Redirect")[len("/tickets/"):]
+	r = transferReq(t, c3, "Eli", "e@x.com")
+	c4 := r.Header().Get("HX-Redirect")[len("/tickets/"):]
+	r = transferReq(t, c4, "Fay", "f@x.com")
+	c5 := r.Header().Get("HX-Redirect")[len("/tickets/"):]
+	if rec := transferReq(t, c5, "Gus", "g@x.com"); rec.Code != 409 || !strings.Contains(rec.Body.String(), "limit of 3 transfers") {
+		t.Fatalf("limit: %d %q", rec.Code, rec.Body.String())
+	}
+	_, m := getJSON(t, c5)
+	if m["transfers"].(float64) != 3 {
+		t.Fatalf("transfers: %v", m["transfers"])
+	}
+	h := m["holders"].([]any)
+	if len(h) != 4 || h[0].(map[string]any)["name"] != "B" || h[3].(map[string]any)["name"] != "Fay" {
+		t.Fatalf("chain: %v", h)
+	}
+	if st, m := getJSON(t, c4); st != 410 || m["message"] != "This ticket was transferred to Fay." {
+		t.Fatalf("dead code: %d %v", st, m)
+	}
+	if rec := scan(t, door, c5); rec.Code != 200 {
+		t.Fatalf("limited code still scans: %d", rec.Code)
+	}
+	if rec := transferReq(t, "TP-DEADBEEF", "X", "x@x.com"); rec.Code != 404 {
+		t.Fatalf("unknown: %d", rec.Code)
+	}
+	if rec := transferReq(t, code, "D", "d@x.com"); rec.Code != 410 {
+		t.Fatalf("order of checks: refunded should beat checked-in, got %d", rec.Code)
+	}
+}
+
+func TestListingCap(t *testing.T) {
+	setup(t)
+	_, code := buyTicket(t, "s1")
+	face := queryInt(t, `SELECT price_cents FROM tickets WHERE code=?`, code)
+	cap := face * 110 / 100
+	for _, p := range []string{"abc", "130.005", "-5", "0"} {
+		if rec := listReq(t, code, p); rec.Code != 422 || !strings.Contains(rec.Body.String(), "Enter a resale price in dollars") {
+			t.Fatalf("price %q: %d %q", p, rec.Code, rec.Body.String())
+		}
+	}
+	want := fmt.Sprintf("Resale price cannot be more than $%.2f, which is 110%% of the $%.2f face value.", float64(cap)/100, float64(face)/100)
+	over := float64(cap)/100 + 0.01
+	if rec := listReq(t, code, fmt.Sprintf("%.2f", over)); rec.Code != 422 || !strings.Contains(rec.Body.String(), want) {
+		t.Fatalf("cap: %d %q", rec.Code, rec.Body.String())
+	}
+	if rec := listReq(t, code, fmt.Sprintf("%.2f", float64(cap)/100)); rec.Header().Get("HX-Redirect") == "" {
+		t.Fatalf("at cap refused: %d %q", rec.Code, rec.Body.String())
+	}
+	st, m := getJSON(t, code)
+	if st != 200 || m["status"] != "listed" || m["listing_price_cents"].(float64) != float64(cap) {
+		t.Fatalf("listed json: %d %v", st, m)
+	}
+	if _, err := db.Exec(`UPDATE tickets SET listing_price_cents=0, price_cents=4900 WHERE code=?`, code); err != nil {
+		t.Fatal(err)
+	}
+	want = "Resale price cannot be more than $53.90, which is 110% of the $49.00 face value."
+	if rec := listReq(t, code, "53.91"); rec.Code != 422 || !strings.Contains(rec.Body.String(), want) {
+		t.Fatalf("cap2: %d %q", rec.Code, rec.Body.String())
+	}
+	if rec := listReq(t, code, "53.90"); rec.Header().Get("HX-Redirect") == "" {
+		t.Fatalf("at cap2 refused: %d %q", rec.Code, rec.Body.String())
+	}
+}
+
+func TestDelistAndTransferWhileListed(t *testing.T) {
+	setup(t)
+	_, code := buyTicket(t, "s1")
+	listReq(t, code, "120.00")
+	if rec := transferReq(t, code, "D", "d@x.com"); rec.Code != 409 || !strings.Contains(rec.Body.String(), "listed for resale. Delist it before transferring") {
+		t.Fatalf("transfer while listed: %d %q", rec.Code, rec.Body.String())
+	}
+	if rec := delistReq(t, code); rec.Header().Get("HX-Redirect") == "" {
+		t.Fatalf("delist: %d %q", rec.Code, rec.Body.String())
+	}
+	if rec := delistReq(t, code); rec.Code != 409 || !strings.Contains(rec.Body.String(), "not listed for resale") {
+		t.Fatalf("delist unlisted: %d %q", rec.Code, rec.Body.String())
+	}
+	if rec := transferReq(t, code, "D", "d@x.com"); rec.Header().Get("HX-Redirect") == "" {
+		t.Fatalf("transfer after delist: %d", rec.Code)
+	}
+}
+
+func TestResalePurchase(t *testing.T) {
+	setup(t)
+	oid, code := buyTicket(t, "s1")
+	seatID := queryInt(t, `SELECT seat_id FROM tickets WHERE code=?`, code)
+	listReq(t, code, "130.00")
+	// seller cannot buy own listing
+	rec := do(t, "POST /events/{id}/seats/{seatID}/toggle", handleToggleSeat, "POST", fmt.Sprintf("/events/1/seats/%d/toggle", seatID), "s1", nil)
+	if !strings.Contains(rec.Body.String(), "cannot buy your own resale listing") {
+		t.Fatalf("own listing: %q", rec.Body.String())
+	}
+	// buyer selects and checks out through the real routes
+	rec = do(t, "POST /events/{id}/seats/{seatID}/toggle", handleToggleSeat, "POST", fmt.Sprintf("/events/1/seats/%d/toggle", seatID), "s2", nil)
+	if st := queryInt(t, `SELECT COUNT(*) FROM seats WHERE id=? AND status='held' AND hold_session='s2'`, seatID); st != 1 {
+		t.Fatalf("resale seat not held")
+	}
+	rec = do(t, "POST /checkout", handleCheckout, "POST", "/checkout", "s2", url.Values{
+		"name": {"Buyer"}, "email": {"buyer@x.com"}, "card": {"4242424242424242"}})
+	newOrder := rec.Header().Get("HX-Redirect")
+	if newOrder == "" {
+		t.Fatalf("checkout: %d %q", rec.Code, rec.Body.String())
+	}
+	newCode := queryStr(t, `SELECT code FROM tickets WHERE seat_id=? AND kind='resale'`, seatID)
+	face := queryInt(t, `SELECT price_cents FROM seats WHERE id=?`, seatID)
+	st, m := getJSON(t, newCode)
+	if st != 200 || m["holder_name"] != "Buyer" || m["transfers"].(float64) != 0 || m["face_value_cents"].(float64) != float64(face) {
+		t.Fatalf("buyer ticket: %d %v", st, m)
+	}
+	if h := m["holders"].([]any); len(h) != 1 {
+		t.Fatalf("buyer chain: %v", h)
+	}
+	st, m = getJSON(t, code)
+	if st != 410 || m["status"] != "resold" || m["resale_price_cents"].(float64) != 13000 ||
+		m["fee_cents"].(float64) != 650 || m["payout_cents"].(float64) != 12350 {
+		t.Fatalf("seller code: %d %v", st, m)
+	}
+	rec = scan(t, doorCode(t), code)
+	if rec.Code != 410 || !strings.Contains(rec.Body.String(), "sold on resale") {
+		t.Fatalf("seller code at door: %d %q", rec.Code, rec.Body.String())
+	}
+	if rec := scan(t, doorCode(t), newCode); rec.Code != 200 || !strings.Contains(rec.Body.String(), "Buyer") {
+		t.Fatalf("buyer code at door: %d", rec.Code)
+	}
+	if n := queryInt(t, `SELECT COUNT(*) FROM resales WHERE ticket_id=(SELECT id FROM tickets WHERE code=?) AND price_cents=13000 AND fee_cents=650 AND payout_cents=12350`, code); n != 1 {
+		t.Fatal("resale row missing")
+	}
+	_ = oid
+}
+
+func TestResaleFees(t *testing.T) {
+	for _, c := range [][3]int64{{13000, 650, 12350}, {13750, 688, 13062}, {5390, 270, 5120}} {
+		fee := (c[0]*5 + 50) / 100
+		if fee != c[1] || c[0]-fee != c[2] {
+			t.Fatalf("price %d: fee %d payout %d", c[0], fee, c[0]-fee)
+		}
+	}
+}
+
+func TestResaleHoldReleased(t *testing.T) {
+	setup(t)
+	_, code := buyTicket(t, "s1")
+	seatID := queryInt(t, `SELECT seat_id FROM tickets WHERE code=?`, code)
+	listReq(t, code, "130.00")
+	do(t, "POST /events/{id}/seats/{seatID}/toggle", handleToggleSeat, "POST", fmt.Sprintf("/events/1/seats/%d/toggle", seatID), "s2", nil)
+	// held: delist refused, then unselect returns to listed
+	if rec := delistReq(t, code); rec.Code != 409 || !strings.Contains(rec.Body.String(), "in a buyer's cart") {
+		t.Fatalf("delist while held: %d %q", rec.Code, rec.Body.String())
+	}
+	do(t, "POST /events/{id}/seats/{seatID}/toggle", handleToggleSeat, "POST", fmt.Sprintf("/events/1/seats/%d/toggle", seatID), "s2", nil)
+	st, m := getJSON(t, code)
+	if st != 200 || m["status"] != "listed" || queryInt(t, `SELECT COUNT(*) FROM seats WHERE id=? AND status='sold'`, seatID) != 1 {
+		t.Fatalf("released: %d %v seat not back to listed", st, m)
+	}
+}
+
+func TestResaleWaitlist(t *testing.T) {
+	setup(t)
+	_, code := buyTicket(t, "s1")
+	seatID := queryInt(t, `SELECT seat_id FROM tickets WHERE code=?`, code)
+	if _, err := db.Exec(`UPDATE seats SET status='sold' WHERE event_id=1`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE seats SET status='sold' WHERE id=?`, seatID); err != nil {
+		t.Fatal(err)
+	}
+	db.Exec(`INSERT INTO waitlist (event_id,session_id,email) VALUES (1,'w1','w1@x'),(1,'w2','w2@x')`)
+	listReq(t, code, "130.00")
+	if n := queryInt(t, `SELECT COUNT(*) FROM waitlist WHERE session_id='w1' AND status='offered' AND offered_seat_id=?`, seatID); n != 1 {
+		t.Fatal("listing did not go to first waiter")
+	}
+	if st := queryInt(t, `SELECT COUNT(*) FROM seats WHERE id=? AND status='held' AND hold_session='w1'`, seatID); st != 1 {
+		t.Fatal("seat not held for waiter")
+	}
+	if rec := delistReq(t, code); rec.Code != 409 {
+		t.Fatalf("delist during offer: %d", rec.Code)
+	}
+	db.Exec(`UPDATE waitlist SET offer_expires_at='2000-01-01T00:00:00Z' WHERE status='offered'`)
+	if err := sweepExpiredOffers(1); err != nil {
+		t.Fatal(err)
+	}
+	if n := queryInt(t, `SELECT COUNT(*) FROM waitlist WHERE session_id='w2' AND status='offered' AND offered_seat_id=?`, seatID); n != 1 {
+		t.Fatal("expired offer did not move to next waiter")
+	}
+}
+
+func TestReportResaleCols(t *testing.T) {
+	setup(t)
+	_, c1 := buyTicket(t, "s1")
+	r := transferReq(t, c1, "Dana", "d@x.com")
+	c2 := r.Header().Get("HX-Redirect")[len("/tickets/"):]
+	transferReq(t, c2, "Eli", "e@x.com")
+	oid2, c3 := buyTicket(t, "s1")
+	seat3 := queryInt(t, `SELECT seat_id FROM tickets WHERE code=?`, c3)
+	listReq(t, c3, "130.00")
+	do(t, "POST /events/{id}/seats/{seatID}/toggle", handleToggleSeat, "POST", fmt.Sprintf("/events/1/seats/%d/toggle", seat3), "s2", nil)
+	do(t, "POST /checkout", handleCheckout, "POST", "/checkout", "s2", url.Values{
+		"name": {"B2"}, "email": {"b2@x.com"}, "card": {"4242424242424242"}})
+	rec := do(t, "GET /admin/report.csv", handleAdminCSV, "GET", "/admin/report.csv", "", nil)
+	body := rec.Body.String()
+	if !strings.Contains(body, "transfers,resale_count,resale_volume,resale_fees") {
+		t.Fatalf("csv header: %q", body)
+	}
+	found := false
+	for _, ln := range strings.Split(body, "\n") {
+		if strings.Contains(ln, "Nova Reign") && strings.Contains(ln, ",2,1,130.00,6.50") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("csv row: %q", body)
+	}
+	v, err := buildReport(reportFilters{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var row ReportRow
+	for _, rr := range v.Rows {
+		if rr.EventID == 1 {
+			row = rr
+		}
+	}
+	if row.Transfers != 2 || row.ResaleCount != 1 || row.ResaleVolumeCents != 13000 || row.ResaleFeesCents != 650 {
+		t.Fatalf("report: %+v", row)
+	}
+	_ = oid2
+}
+
+func TestPromoAndGroupDealOnResale(t *testing.T) {
+	setup(t)
+	db.Exec(`INSERT INTO promos (code,percent_off) VALUES ('ENCORE20',20)`)
+	_, code := buyTicket(t, "s1")
+	seatR := queryInt(t, `SELECT seat_id FROM tickets WHERE code=?`, code)
+	listReq(t, code, "130.00")
+	var n4, n5 int64
+	db.QueryRow(`SELECT s1.id, s2.id FROM seats s1 JOIN seats s2 ON s2.event_id=s1.event_id AND s2.section=s1.section AND s2.row=s1.row AND s2.number=s1.number+1
+		WHERE s1.event_id=1 AND s1.status='available' AND s2.status='available' AND s1.section='Floor'
+		AND s1.price_cents=12500 AND s2.price_cents=12500 AND s1.id<>? AND s2.id<>?`, seatR, seatR).Scan(&n4, &n5)
+	holdSeat(t, n4, "s2")
+	holdSeat(t, n5, "s2")
+	do(t, "POST /events/{id}/seats/{seatID}/toggle", handleToggleSeat, "POST", fmt.Sprintf("/events/1/seats/%d/toggle", seatR), "s2", nil)
+	rec := do(t, "POST /checkout", handleCheckout, "POST", "/checkout", "s2", url.Values{
+		"name": {"B"}, "email": {"b@x.com"}, "card": {"4242424242424242"}, "promo": {"ENCORE20"}})
+	newOrder := rec.Header().Get("HX-Redirect")[len("/orders/"):]
+	var total, disc, grp int64
+	var promo string
+	db.QueryRow(`SELECT total_cents,discount_cents,group_discount_cents,COALESCE(promo_code,'') FROM orders WHERE id=?`, newOrder).Scan(&total, &disc, &grp, &promo)
+	if grp != 2500 || disc != 4500 || total != 31000 || promo != "ENCORE20" {
+		t.Fatalf("mixed order: grp %d disc %d total %d promo %q", grp, disc, total, promo)
+	}
+	// resale-only cart: promo not applied, uses unchanged
+	_, c2 := buyTicket(t, "s1")
+	seatR2 := queryInt(t, `SELECT seat_id FROM tickets WHERE code=?`, c2)
+	listReq(t, c2, "100.00")
+	do(t, "POST /events/{id}/seats/{seatID}/toggle", handleToggleSeat, "POST", fmt.Sprintf("/events/1/seats/%d/toggle", seatR2), "s3", nil)
+	rec = do(t, "POST /checkout", handleCheckout, "POST", "/checkout", "s3", url.Values{
+		"name": {"B"}, "email": {"b@x.com"}, "card": {"4242424242424242"}, "promo": {"ENCORE20"}})
+	newOrder = rec.Header().Get("HX-Redirect")[len("/orders/"):]
+	db.QueryRow(`SELECT total_cents,discount_cents,COALESCE(promo_code,'') FROM orders WHERE id=?`, newOrder).Scan(&total, &disc, &promo)
+	if total != 10000 || disc != 0 || promo != "" {
+		t.Fatalf("resale-only: total %d disc %d promo %q", total, disc, promo)
+	}
+	if n := queryInt(t, `SELECT uses FROM promos WHERE code='ENCORE20'`); n != 1 {
+		t.Fatalf("promo uses moved: %d", n)
+	}
+}
+
+func TestRefundRefusals(t *testing.T) {
+	setup(t)
+	oid1, c1 := buyTicket(t, "s1")
+	transferReq(t, c1, "Dana", "d@x.com")
+	rec := do(t, "POST /orders/{id}/refund", handleRefund, "POST", fmt.Sprintf("/orders/%d/refund", oid1), "s1", nil)
+	if rec.Code != 409 || !strings.Contains(rec.Body.String(), "transferred or resold") {
+		t.Fatalf("transferred refund: %d %q", rec.Code, rec.Body.String())
+	}
+	oid2, c2 := buyTicket(t, "s1")
+	listReq(t, c2, "120.00")
+	rec = do(t, "POST /orders/{id}/refund", handleRefund, "POST", fmt.Sprintf("/orders/%d/refund", oid2), "s1", nil)
+	if rec.Code != 409 || !strings.Contains(rec.Body.String(), "listed for resale. Delist it before refunding") {
+		t.Fatalf("listed refund: %d %q", rec.Code, rec.Body.String())
+	}
+	seat2 := queryInt(t, `SELECT seat_id FROM tickets WHERE code=?`, c2)
+	do(t, "POST /events/{id}/seats/{seatID}/toggle", handleToggleSeat, "POST", fmt.Sprintf("/events/1/seats/%d/toggle", seat2), "s2", nil)
+	rec = do(t, "POST /checkout", handleCheckout, "POST", "/checkout", "s2", url.Values{
+		"name": {"B"}, "email": {"b@x.com"}, "card": {"4242424242424242"}})
+	resaleOrder := rec.Header().Get("HX-Redirect")[len("/orders/"):]
+	rec = do(t, "POST /orders/{id}/refund", handleRefund, "POST", "/orders/"+resaleOrder+"/refund", "s2", nil)
+	if rec.Code != 409 || !strings.Contains(rec.Body.String(), "Resale purchases are final") {
+		t.Fatalf("resale refund: %d %q", rec.Code, rec.Body.String())
+	}
+	if st := queryInt(t, `SELECT COUNT(*) FROM orders WHERE id=? AND status='paid'`, oid2); st != 1 {
+		t.Fatal("refusal changed the order")
+	}
+}
+
+func orderPageBody(t *testing.T, oid int64, sid string) string {
+	t.Helper()
+	return do(t, "GET /orders/{id}", handleOrder, "GET", fmt.Sprintf("/orders/%d", oid), sid, nil).Body.String()
+}
+
+func TestOrderPageAfterTransfer(t *testing.T) {
+	setup(t)
+	oid, code := buyTicket(t, "s1")
+	body := orderPageBody(t, oid, "s1")
+	if !strings.Contains(body, code) || !strings.Contains(body, "Transfer") {
+		t.Fatal("live ticket should show its code and a transfer form")
+	}
+	rec := transferReq(t, code, "Dana Lee", "dana@example.com")
+	newCode := rec.Header().Get("HX-Redirect")[len("/tickets/"):]
+	body = orderPageBody(t, oid, "s1")
+	if strings.Contains(body, newCode) {
+		t.Fatal("new code must never reach the original buyer's order page")
+	}
+	if strings.Contains(body, code) {
+		t.Fatal("transferred ticket should show no code")
+	}
+	if !strings.Contains(body, "Transferred to Dana Lee") {
+		t.Fatalf("missing transferred text: %q", body)
+	}
+}
+
+func TestOrderPageResalePayout(t *testing.T) {
+	setup(t)
+	oid, code := buyTicket(t, "s1")
+	seatID := queryInt(t, `SELECT seat_id FROM tickets WHERE code=?`, code)
+	listReq(t, code, "130.00")
+	do(t, "POST /events/{id}/seats/{seatID}/toggle", handleToggleSeat, "POST", fmt.Sprintf("/events/1/seats/%d/toggle", seatID), "s2", nil)
+	rec := do(t, "POST /checkout", handleCheckout, "POST", "/checkout", "s2", url.Values{
+		"name": {"B"}, "email": {"b@x.com"}, "card": {"4242424242424242"}})
+	buyerOrder := rec.Header().Get("HX-Redirect")[len("/orders/"):]
+	body := orderPageBody(t, oid, "s1")
+	if !strings.Contains(body, "Sold on resale · Payout $123.50") {
+		t.Fatalf("missing payout text: %q", body)
+	}
+	if strings.Contains(body, code) {
+		t.Fatal("resold ticket should show no code")
+	}
+	// the buyer's order page shows the new code with its QR
+	newCode := queryStr(t, `SELECT code FROM tickets WHERE seat_id=? AND kind='resale'`, seatID)
+	body = orderPageBody(t, queryInt(t, `SELECT id FROM orders ORDER BY id DESC LIMIT 1`), "s2")
+	if !strings.Contains(body, newCode) {
+		t.Fatalf("buyer order page should show the new code, order %s", buyerOrder)
+	}
+}
+
+func TestCheckoutResaleSentence(t *testing.T) {
+	setup(t)
+	sentence := "Promo codes and group deals do not apply to resale seats."
+	// no resale seat in cart — no sentence
+	holdSeat(t, 65, "s2")
+	body := do(t, "GET /checkout", handleCheckoutPage, "GET", "/checkout", "s2", nil).Body.String()
+	if strings.Contains(body, sentence) {
+		t.Fatal("sentence shown without a resale seat")
+	}
+	// add a resale seat — sentence appears
+	_, code := buyTicket(t, "s1")
+	seatID := queryInt(t, `SELECT seat_id FROM tickets WHERE code=?`, code)
+	listReq(t, code, "130.00")
+	do(t, "POST /events/{id}/seats/{seatID}/toggle", handleToggleSeat, "POST", fmt.Sprintf("/events/1/seats/%d/toggle", seatID), "s2", nil)
+	body = do(t, "GET /checkout", handleCheckoutPage, "GET", "/checkout", "s2", nil).Body.String()
+	if !strings.Contains(body, sentence) {
+		t.Fatal("sentence missing with a resale seat in the cart")
+	}
+}
