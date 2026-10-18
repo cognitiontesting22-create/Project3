@@ -9,6 +9,9 @@ import (
 	"html/template"
 	"log"
 	"net/http"
+	"os"
+	"strconv"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -57,7 +60,17 @@ func main() {
 	mux.HandleFunc("GET /checkin/{doorCode}", handleCheckinPage)
 	mux.HandleFunc("POST /checkin/{doorCode}", handleCheckinScan)
 	mux.HandleFunc("GET /checkin/{doorCode}/status", handleCheckinStatus)
+	mux.HandleFunc("GET /tickets/{code}", handleTicketPage)
+	mux.HandleFunc("POST /tickets/{code}/transfer", handleTicketTransfer)
+	mux.HandleFunc("POST /tickets/{code}/list", handleTicketList)
+	mux.HandleFunc("POST /tickets/{code}/delist", handleTicketDelist)
 	mux.Handle("GET /static/", http.FileServerFS(assets))
+
+	if v := strings.TrimSpace(os.Getenv("OFFER_TTL_SECONDS")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			offerTTL = time.Duration(n) * time.Second
+		}
+	}
 
 	addr := ":8080"
 	log.Printf("ticketpunch listening on http://localhost%s", addr)
@@ -82,6 +95,7 @@ func parseTemplates() *template.Template {
 			}
 			return a * 100 / b
 		},
+		"sub": func(a, b int) int { return a - b },
 		"seq": func(lo, hi int) []int {
 			out := make([]int, 0, hi-lo+1)
 			for i := lo; i <= hi; i++ {

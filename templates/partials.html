@@ -56,7 +56,8 @@ tailwind.config = {
 {{$state := .SeatState}}
 <button type="button"
   class="seat seat-{{$state}}{{if eq $state "available"}} tier-{{.Tier}}{{end}}"
-  title="{{.Section}} · {{.Tier}} · Row {{.Row}} Seat {{.Number}} — {{money .PriceCents}}"
+  {{if eq $state "resale"}}title="{{.Section}} · Resale · Row {{.Row}} Seat {{.Number}} — {{money .ResaleCents}}"
+  {{else}}title="{{.Section}} · {{.Tier}} · Row {{.Row}} Seat {{.Number}} — {{money .PriceCents}}"{{end}}
   {{if ne $state "sold"}}hx-post="/events/{{.EventID}}/seats/{{.ID}}/toggle" hx-swap="outerHTML" hx-target="this"{{else}}disabled{{end}}>
   <span class="sr-only">{{.Section}} row {{.Row}} seat {{.Number}}, {{.Tier}} {{money .PriceCents}}</span>
 </button>
@@ -90,8 +91,8 @@ tailwind.config = {
   <ul class="mt-4 space-y-2.5">
     {{range .Seats}}
     <li class="flex items-center justify-between rounded-lg bg-white/5 px-3 py-2 text-sm">
-      <span class="font-medium">{{.Section}} · {{.Label}} <span class="text-xs font-normal text-zinc-500">{{.Tier}}</span></span>
-      <span class="text-zinc-400">{{money .PriceCents}}</span>
+      <span class="font-medium">{{.Section}} · {{.Label}} <span class="text-xs font-normal text-zinc-500">{{if .ResaleCents}}Resale{{else}}{{.Tier}}{{end}}</span></span>
+      <span class="text-zinc-400">{{money .CartCents}}</span>
     </li>
     {{end}}
   </ul>

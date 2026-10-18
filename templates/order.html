@@ -66,7 +66,7 @@
 
   <div class="mt-10 flex items-center justify-between">
     <a href="/" class="text-sm font-semibold text-fuchsia-400 hover:text-fuchsia-300">← Browse more events</a>
-    {{if and .IsOwner (eq .Order.Status "paid")}}
+    {{if and .IsOwner $.Refundable (eq .Order.Status "paid")}}
     <button hx-post="/orders/{{.Order.ID}}/refund" hx-confirm="Refund this order? All {{len .Tickets}} seat{{if ne (len .Tickets) 1}}s{{end}} will be released and {{money .Order.TotalCents}} returned."
       class="rounded-xl border border-white/10 px-4 py-2.5 text-sm font-medium text-zinc-400 transition-colors hover:border-rose-500/40 hover:text-rose-300">
       Refund order

@@ -13,6 +13,7 @@ import (
 	"math"
 	"net/http"
 	"net/url"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -55,6 +56,7 @@ type Seat struct {
 	Status      string // raw status: available | held | sold
 	Tier        string // Premium | Standard | Value
 	HoldSession string
+	ResaleCents int64  // >0 when a listed resale ticket lives on this seat
 	Viewer      string // requesting session, used to render state
 	EventName   string // "Artist — Title", populated for cart/checkout views
 }
@@ -67,15 +69,26 @@ func (s Seat) Mine() bool {
 // Label is a short human label like "B12".
 func (s Seat) Label() string { return s.Row + strconv.FormatInt(s.Number, 10) }
 
+// CartCents is what the buyer pays for this seat: the resale price when it is
+// a resale listing, else the face price.
+func (s Seat) CartCents() int64 {
+	if s.ResaleCents > 0 {
+		return s.ResaleCents
+	}
+	return s.PriceCents
+}
+
 // SeatState resolves how to render the seat for the requesting session.
 func (s Seat) SeatState() string {
 	switch {
-	case s.Status == "sold":
-		return "sold"
 	case s.Mine():
 		return "selected"
 	case s.Status == "held":
 		return "sold" // held by someone else looks taken
+	case s.Status == "sold" && s.ResaleCents > 0:
+		return "resale"
+	case s.Status == "sold":
+		return "sold"
 	default:
 		return "available"
 	}
@@ -158,6 +171,7 @@ type CartView struct {
 	DealCents  int64 // automatic adjacent-seat discount
 	Used       int64 // seats already owned + currently held for this event
 	Max        int64
+	HasResale  bool
 	Err        string
 }
 
@@ -167,9 +181,12 @@ type eventPage struct {
 	Cart     CartView
 	Promo    *Promo
 	Waitlist *WaitlistView
+	Resale   []Seat
 }
 
-const offerTTL = 15 * time.Minute
+// offerTTL is how long a waitlist offer holds a seat. OFFER_TTL_SECONDS
+// overrides the default at startup; unset or non-positive means 900.
+var offerTTL = 15 * time.Minute
 
 // WaitlistView is the sidebar card for a sold-out event.
 // State is "join", "waiting" or "offered"; empty means show nothing.
@@ -179,6 +196,7 @@ type WaitlistView struct {
 	Position    int64
 	Email       string
 	SeatLabel   string
+	ResaleCents int64
 	MinutesLeft int64
 	Err         string
 }
@@ -227,20 +245,31 @@ type Order struct {
 }
 
 type Ticket struct {
-	ID          int64
-	Code        string
-	Section     string
-	Row         string
-	Number      int64
-	Tier        string
-	CheckedInAt string
-	EventID     int64
-	Artist      string
-	Title       string
-	Venue       string
-	City        string
-	StartsAt    string
-	Gradient    string
+	ID               int64
+	Code             string
+	Section          string
+	Row              string
+	Number           int64
+	Tier             string
+	CheckedInAt      string
+	HolderName       string
+	HolderEmail      string
+	ListingCents     int64
+	Resold           bool
+	ResalePriceCents int64
+	PayoutCents      int64
+	Kind             string
+	Transfers        int64
+	Transferred      bool
+	TransferredTo    string
+	CanTransfer      bool
+	EventID          int64
+	Artist           string
+	Title            string
+	Venue            string
+	City             string
+	StartsAt         string
+	Gradient         string
 }
 
 // ---------- handlers ----------
@@ -302,7 +331,17 @@ func handleEvent(w http.ResponseWriter, r *http.Request) {
 		httpErr(w, err)
 		return
 	}
-	render(w, "event.html", eventPage{Event: e, Sections: sections, Cart: cart, Promo: promoForSession(sid), Waitlist: wl})
+	var resale []Seat
+	for _, sec := range sections {
+		for _, r := range sec.Rows {
+			for _, seat := range r.Seats {
+				if seat.Status == "sold" && seat.ResaleCents > 0 {
+					resale = append(resale, seat)
+				}
+			}
+		}
+	}
+	render(w, "event.html", eventPage{Event: e, Sections: sections, Cart: cart, Promo: promoForSession(sid), Waitlist: wl, Resale: resale})
 }
 
 func handleToggleSeat(w http.ResponseWriter, r *http.Request) {
@@ -318,9 +357,10 @@ func handleToggleSeat(w http.ResponseWriter, r *http.Request) {
 	defer tx.Rollback()
 
 	var seat Seat
-	err = tx.QueryRow(`SELECT id,event_id,section,row,number,price_cents,status,COALESCE(hold_session,''),tier
-		FROM seats WHERE id=? AND event_id=?`, seatID, eventID).
-		Scan(&seat.ID, &seat.EventID, &seat.Section, &seat.Row, &seat.Number, &seat.PriceCents, &seat.Status, &seat.HoldSession, &seat.Tier)
+	err = tx.QueryRow(`SELECT s.id,s.event_id,s.section,s.row,s.number,s.price_cents,s.status,COALESCE(s.hold_session,''),s.tier,
+		COALESCE((SELECT t2.listing_price_cents FROM tickets t2 JOIN orders o2 ON o2.id=t2.order_id WHERE t2.seat_id=s.id AND t2.resold=0 AND o2.status='paid' AND t2.listing_price_cents>0),0)
+		FROM seats s WHERE s.id=? AND s.event_id=?`, seatID, eventID).
+		Scan(&seat.ID, &seat.EventID, &seat.Section, &seat.Row, &seat.Number, &seat.PriceCents, &seat.Status, &seat.HoldSession, &seat.Tier, &seat.ResaleCents)
 	if err != nil {
 		http.NotFound(w, r)
 		return
@@ -329,6 +369,32 @@ func handleToggleSeat(w http.ResponseWriter, r *http.Request) {
 	seat.Viewer = sid
 	var capErr string
 	switch {
+	case seat.Status == "sold" && seat.ResaleCents > 0:
+		// a listed resale seat — hold it like any seat, but never to its own seller
+		var sellerSid string
+		if err := tx.QueryRow(`SELECT o2.session_id FROM tickets t2 JOIN orders o2 ON o2.id=t2.order_id WHERE t2.seat_id=? AND t2.resold=0 AND o2.status='paid' AND t2.listing_price_cents>0`, seat.ID).Scan(&sellerSid); err != nil {
+			httpErr(w, err)
+			return
+		}
+		if sellerSid == sid {
+			capErr = "You cannot buy your own resale listing."
+			break
+		}
+		owned, held, err := ticketUsage(eventID, sid)
+		if err != nil {
+			httpErr(w, err)
+			return
+		}
+		if owned+held >= maxTicketsPerEvent {
+			capErr = fmt.Sprintf("Limit of %d tickets per event — you've already got %d.", maxTicketsPerEvent, owned+held)
+			break
+		}
+		if _, err := tx.Exec(`UPDATE seats SET status='held', hold_session=? WHERE id=?`, sid, seat.ID); err != nil {
+			httpErr(w, err)
+			return
+		}
+		seat.Status = "held"
+		seat.HoldSession = sid
 	case seat.Status == "available":
 		owned, held, err := ticketUsage(eventID, sid)
 		if err != nil {
@@ -346,14 +412,22 @@ func handleToggleSeat(w http.ResponseWriter, r *http.Request) {
 		seat.Status = "held"
 		seat.HoldSession = sid
 	case seat.Mine():
-		if _, err := tx.Exec(`UPDATE seats SET status='available', hold_session=NULL WHERE id=?`, seat.ID); err != nil {
-			httpErr(w, err)
-			return
-		}
-		// a released seat goes to the next person in line, if anyone's waiting
-		if err := releaseSeatOffers(tx, seat.ID, eventID); err != nil {
-			httpErr(w, err)
-			return
+		if seat.ResaleCents > 0 {
+			// back to a live listing, not to the pool
+			if _, err := tx.Exec(`UPDATE seats SET status='sold', hold_session=NULL WHERE id=?`, seat.ID); err != nil {
+				httpErr(w, err)
+				return
+			}
+		} else {
+			if _, err := tx.Exec(`UPDATE seats SET status='available', hold_session=NULL WHERE id=?`, seat.ID); err != nil {
+				httpErr(w, err)
+				return
+			}
+			// a released seat goes to the next person in line, if anyone's waiting
+			if err := releaseSeatOffers(tx, seat.ID, eventID); err != nil {
+				httpErr(w, err)
+				return
+			}
 		}
 		if err := tx.QueryRow(`SELECT status, COALESCE(hold_session,'') FROM seats WHERE id=?`, seat.ID).
 			Scan(&seat.Status, &seat.HoldSession); err != nil {
@@ -560,6 +634,18 @@ func handleClearCart(w http.ResponseWriter, r *http.Request) {
 	}
 	rows.Close()
 	for _, seatID := range released {
+		var listed int64
+		if err := tx.QueryRow(`SELECT COUNT(*) FROM tickets t2 JOIN orders o2 ON o2.id=t2.order_id WHERE t2.seat_id=? AND t2.resold=0 AND o2.status='paid' AND t2.listing_price_cents>0`, seatID).Scan(&listed); err != nil {
+			httpErr(w, err)
+			return
+		}
+		if listed > 0 {
+			if _, err := tx.Exec(`UPDATE seats SET status='sold', hold_session=NULL WHERE id=?`, seatID); err != nil {
+				httpErr(w, err)
+				return
+			}
+			continue
+		}
 		if _, err := tx.Exec(`UPDATE seats SET status='available', hold_session=NULL WHERE id=?`, seatID); err != nil {
 			httpErr(w, err)
 			return
@@ -598,6 +684,7 @@ type checkoutView struct {
 	TotalCents    int64
 	PromoCode     string
 	PromoErr      string
+	HasResale     bool
 	Err           string
 }
 
@@ -617,12 +704,24 @@ func buildCheckoutView(sid, promoCode string) (checkoutView, error) {
 		return checkoutView{}, err
 	}
 	v := checkoutView{Event: e, Seats: seats, PromoCode: promoCode}
+	var normal []Seat
 	for _, s := range seats {
-		v.SubtotalCents += s.PriceCents
+		v.SubtotalCents += s.CartCents()
+		if s.ResaleCents == 0 {
+			normal = append(normal, s)
+		} else {
+			v.HasResale = true
+		}
 	}
-	v.GroupCents = groupDiscount(seats)
-	base := v.SubtotalCents - v.GroupCents // promos stack on the deal price
-	if promoCode != "" {
+	var normalSub int64
+	for _, s := range normal {
+		normalSub += s.PriceCents
+	}
+	v.GroupCents = groupDiscount(normal)
+	// promos stack on the deal price of normal seats only — resale seats are
+	// never discounted and never join a run
+	base := normalSub - v.GroupCents
+	if promoCode != "" && base > 0 {
 		p, err := promoByCode(promoCode)
 		switch {
 		case errors.Is(err, sql.ErrNoRows):
@@ -637,7 +736,7 @@ func buildCheckoutView(sid, promoCode string) (checkoutView, error) {
 			}
 		}
 	}
-	v.TotalCents = base - v.DiscountCents
+	v.TotalCents = base - v.DiscountCents + (v.SubtotalCents - normalSub)
 	return v, nil
 }
 
@@ -722,7 +821,9 @@ func handleCheckout(w http.ResponseWriter, r *http.Request) {
 	defer tx.Rollback()
 
 	// Confirm the seats are still held by this session before charging.
-	rows, err := tx.Query(`SELECT id, event_id, section, row, number, price_cents FROM seats WHERE status='held' AND hold_session=?`, sid)
+	rows, err := tx.Query(`SELECT s.id, s.event_id, s.section, s.row, s.number, s.price_cents,
+		COALESCE((SELECT t2.listing_price_cents FROM tickets t2 JOIN orders o2 ON o2.id=t2.order_id WHERE t2.seat_id=s.id AND t2.resold=0 AND o2.status='paid' AND t2.listing_price_cents>0),0)
+		FROM seats s WHERE s.status='held' AND s.hold_session=?`, sid)
 	if err != nil {
 		httpErr(w, err)
 		return
@@ -731,13 +832,13 @@ func handleCheckout(w http.ResponseWriter, r *http.Request) {
 	var subtotal int64
 	for rows.Next() {
 		var s Seat
-		if err := rows.Scan(&s.ID, &s.EventID, &s.Section, &s.Row, &s.Number, &s.PriceCents); err != nil {
+		if err := rows.Scan(&s.ID, &s.EventID, &s.Section, &s.Row, &s.Number, &s.PriceCents, &s.ResaleCents); err != nil {
 			rows.Close()
 			httpErr(w, err)
 			return
 		}
 		held = append(held, s)
-		subtotal += s.PriceCents
+		subtotal += s.CartCents()
 	}
 	rows.Close()
 	if len(held) == 0 {
@@ -761,12 +862,20 @@ func handleCheckout(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	group := groupDiscount(held)
-	base := subtotal - group // promos stack on the deal price, same as display
+	var normalHeld []Seat
+	var normalSub int64
+	for _, hs := range held {
+		if hs.ResaleCents == 0 {
+			normalHeld = append(normalHeld, hs)
+			normalSub += hs.PriceCents
+		}
+	}
+	group := groupDiscount(normalHeld)
+	base := normalSub - group // promos stack on the deal price, same as display
 
 	var discount int64
 	var appliedCode string
-	if promoInput != "" {
+	if promoInput != "" && base > 0 {
 		var p Promo
 		var exp sql.NullString
 		var max sql.NullInt64
@@ -804,6 +913,7 @@ func handleCheckout(w http.ResponseWriter, r *http.Request) {
 	}
 	total := base - discount
 
+	total = base - discount + (subtotal - normalSub) // resale seats full price on top
 	res, err := tx.Exec(`INSERT INTO orders (session_id,name,email,total_cents,promo_code,discount_cents,group_discount_cents) VALUES (?,?,?,?,?,?,?)`,
 		sid, name, email, total, appliedCode, discount, group)
 	if err != nil {
@@ -820,6 +930,33 @@ func handleCheckout(w http.ResponseWriter, r *http.Request) {
 		if _, err := tx.Exec(`UPDATE waitlist SET status='claimed' WHERE offered_seat_id=? AND status='offered' AND session_id=?`, hs.ID, sid); err != nil {
 			httpErr(w, err)
 			return
+		}
+		if hs.ResaleCents > 0 {
+			// resale: the seller's ticket dies, a fresh ticket goes to the buyer
+			var oldTID, oldOID, face int64
+			err := tx.QueryRow(`SELECT t2.id, t2.order_id, t2.price_cents FROM tickets t2 JOIN orders o2 ON o2.id=t2.order_id
+				WHERE t2.seat_id=? AND t2.resold=0 AND o2.status='paid' AND t2.listing_price_cents>0`, hs.ID).
+				Scan(&oldTID, &oldOID, &face)
+			if err != nil {
+				httpErr(w, err)
+				return
+			}
+			fee := (hs.ResaleCents*5 + 50) / 100 // 5%, halves round up
+			if _, err := tx.Exec(`UPDATE tickets SET resold=1, resale_price_cents=?, listing_price_cents=0 WHERE id=?`, hs.ResaleCents, oldTID); err != nil {
+				httpErr(w, err)
+				return
+			}
+			if _, err := tx.Exec(`INSERT INTO resales (ticket_id,event_id,seller_order_id,buyer_order_id,price_cents,fee_cents,payout_cents,created_at)
+				VALUES (?,?,?,?,?,?,?,strftime('%Y-%m-%dT%H:%M:%SZ','now'))`, oldTID, hs.EventID, oldOID, orderID, hs.ResaleCents, fee, hs.ResaleCents-fee); err != nil {
+				httpErr(w, err)
+				return
+			}
+			if _, err := tx.Exec(`INSERT INTO tickets (order_id, seat_id, code, price_cents, kind, holder_name, holder_email) VALUES (?,?,?,?,?,?,?)`,
+				orderID, hs.ID, "TP-"+strings.ToUpper(newID(5)), face, "resale", name, email); err != nil {
+				httpErr(w, err)
+				return
+			}
+			continue
 		}
 		if _, err := tx.Exec(`INSERT INTO tickets (order_id, seat_id, code, price_cents) VALUES (?,?,?,?)`, orderID, hs.ID, "TP-"+strings.ToUpper(newID(5)), hs.PriceCents); err != nil {
 			httpErr(w, err)
@@ -859,6 +996,8 @@ func handleOrder(w http.ResponseWriter, r *http.Request) {
 	}
 	rows, err := db.Query(`
 		SELECT t.id, t.code, s.section, s.row, s.number, s.tier, COALESCE(t.checked_in_at,''),
+		       t.holder_name, t.holder_email, t.listing_price_cents, t.resold, t.resale_price_cents, t.kind,
+		       (SELECT COUNT(*) FROM transfers tr WHERE tr.ticket_id=t.id),
 		       e.id, e.artist, e.title, e.venue, e.city, e.starts_at, e.gradient
 		FROM tickets t
 		JOIN seats s ON s.id = t.seat_id
@@ -871,21 +1010,31 @@ func handleOrder(w http.ResponseWriter, r *http.Request) {
 	}
 	defer rows.Close()
 	var tickets []Ticket
+	refundable := true
 	for rows.Next() {
 		var t Ticket
 		if err := rows.Scan(&t.ID, &t.Code, &t.Section, &t.Row, &t.Number, &t.Tier, &t.CheckedInAt,
+			&t.HolderName, &t.HolderEmail, &t.ListingCents, &t.Resold, &t.ResalePriceCents, &t.Kind, &t.Transfers,
 			&t.EventID, &t.Artist, &t.Title, &t.Venue, &t.City, &t.StartsAt, &t.Gradient); err != nil {
 			httpErr(w, err)
 			return
+		}
+		t.Transferred = t.Transfers > 0
+		t.TransferredTo = t.HolderName
+		t.CanTransfer = o.Status == "paid" && t.CheckedInAt == "" && !t.Transferred && !t.Resold && t.ListingCents == 0
+		t.PayoutCents = t.ResalePriceCents - (t.ResalePriceCents*5+50)/100
+		if t.Transferred || t.Resold || t.ListingCents > 0 || t.Kind == "resale" {
+			refundable = false
 		}
 		tickets = append(tickets, t)
 	}
 	o.RefundedAt = refundedAt.String
 	render(w, "order.html", struct {
-		Order   Order
-		Tickets []Ticket
-		IsOwner bool
-	}{o, tickets, o.SessionID == sessionID(r)})
+		Order      Order
+		Tickets    []Ticket
+		IsOwner    bool
+		Refundable bool
+	}{o, tickets, o.SessionID == sessionID(r), refundable})
 }
 
 // handleRefund cancels a paid order: every seat is freed (and offered to the
@@ -923,6 +1072,27 @@ func handleRefund(w http.ResponseWriter, r *http.Request) {
 	url := fmt.Sprintf("/orders/%d", orderID)
 	if status != "paid" {
 		http.Redirect(w, r, url, http.StatusSeeOther)
+		return
+	}
+
+	var moved, listed, boughtResale int64
+	if err := tx.QueryRow(`SELECT
+		(SELECT COUNT(*) FROM tickets t WHERE t.order_id=? AND (t.resold=1 OR EXISTS(SELECT 1 FROM transfers tr WHERE tr.ticket_id=t.id))),
+		(SELECT COUNT(*) FROM tickets t WHERE t.order_id=? AND t.listing_price_cents>0 AND t.resold=0),
+		(SELECT COUNT(*) FROM tickets t WHERE t.order_id=? AND t.kind='resale')`, orderID, orderID, orderID).
+		Scan(&moved, &listed, &boughtResale); err != nil {
+		httpErr(w, err)
+		return
+	}
+	switch {
+	case moved > 0:
+		http.Error(w, "This order cannot be refunded because a ticket in it was transferred or resold.", http.StatusConflict)
+		return
+	case listed > 0:
+		http.Error(w, "This order has a ticket listed for resale. Delist it before refunding.", http.StatusConflict)
+		return
+	case boughtResale > 0:
+		http.Error(w, "Resale purchases are final and cannot be refunded.", http.StatusConflict)
 		return
 	}
 
@@ -1123,6 +1293,7 @@ func eventByCheckinCode(code string) (Event, error) {
 // CheckinResult is one scan outcome, rendered as a card or JSON.
 type CheckinResult struct {
 	OK          bool
+	Result      string // JSON result override (transferred, resold); empty = derive from status
 	Msg         string
 	Code        string
 	Section     string
@@ -1132,7 +1303,9 @@ type CheckinResult struct {
 	CheckedInAt string
 }
 
-func (r CheckinResult) SeatLabel() string { return r.Section + " · " + r.Row + strconv.FormatInt(r.Number, 10) }
+func (r CheckinResult) SeatLabel() string {
+	return r.Section + " · " + r.Row + strconv.FormatInt(r.Number, 10)
+}
 
 // checkinRespond sends the result card to htmx callers and JSON to anything
 // asking for it — a real scanner can integrate against the same endpoint.
@@ -1140,8 +1313,11 @@ func (r CheckinResult) SeatLabel() string { return r.Section + " · " + r.Row + 
 // 422 wrong event, 404 unknown ticket/door code, 400 empty field.
 func checkinRespond(w http.ResponseWriter, r *http.Request, status int, res CheckinResult) {
 	if strings.Contains(r.Header.Get("Accept"), "application/json") {
-		result := "checked_in"
-		if !res.OK {
+		result := res.Result
+		if result == "" {
+			result = "checked_in"
+		}
+		if !res.OK && res.Result == "" {
 			switch status {
 			case http.StatusConflict:
 				result = "already_checked_in"
@@ -1176,7 +1352,7 @@ func checkinRespond(w http.ResponseWriter, r *http.Request, status int, res Chec
 
 func checkinResultFor(code string) (CheckinResult, error) {
 	var res CheckinResult
-	err := db.QueryRow(`SELECT t.code, COALESCE(t.checked_in_at,''), s.section, s.row, s.number, o.name
+	err := db.QueryRow(`SELECT t.code, COALESCE(t.checked_in_at,''), s.section, s.row, s.number, COALESCE(NULLIF(t.holder_name,''),o.name)
 		FROM tickets t JOIN seats s ON s.id=t.seat_id JOIN orders o ON o.id=t.order_id
 		WHERE t.code=?`, code).
 		Scan(&res.Code, &res.CheckedInAt, &res.Section, &res.Row, &res.Number, &res.Holder)
@@ -1203,14 +1379,14 @@ func getCheckinStatus(eventID int64) (checkinStatus, error) {
 	var st checkinStatus
 	err := db.QueryRow(`SELECT
 		(SELECT COUNT(*) FROM tickets t JOIN orders o ON o.id=t.order_id JOIN seats s ON s.id=t.seat_id
-		  WHERE s.event_id=? AND o.status='paid' AND t.checked_in_at IS NOT NULL),
+		  WHERE s.event_id=? AND o.status='paid' AND t.resold=0 AND t.checked_in_at IS NOT NULL),
 		(SELECT COUNT(*) FROM tickets t JOIN orders o ON o.id=t.order_id JOIN seats s ON s.id=t.seat_id
-		  WHERE s.event_id=? AND o.status='paid')`, eventID, eventID).
+		  WHERE s.event_id=? AND o.status='paid' AND t.resold=0)`, eventID, eventID).
 		Scan(&st.CheckedIn, &st.Sold)
 	if err != nil {
 		return st, err
 	}
-	rows, err := db.Query(`SELECT t.code, s.section, s.row||s.number, o.name, t.checked_in_at
+	rows, err := db.Query(`SELECT t.code, s.section, s.row||s.number, COALESCE(NULLIF(t.holder_name,''),o.name), t.checked_in_at
 		FROM tickets t JOIN orders o ON o.id=t.order_id JOIN seats s ON s.id=t.seat_id
 		WHERE s.event_id=? AND t.checked_in_at IS NOT NULL
 		ORDER BY t.checked_in_at DESC, t.id DESC LIMIT 8`, eventID)
@@ -1293,8 +1469,8 @@ func handleCheckinScan(w http.ResponseWriter, r *http.Request) {
 		checkinRespond(w, r, http.StatusBadRequest, CheckinResult{Msg: "Enter a ticket code first."})
 		return
 	}
-	res, err := db.Exec(`UPDATE tickets SET checked_in_at=strftime('%Y-%m-%dT%H:%M:%SZ','now'), checked_in_by=?
-		WHERE code=? AND checked_in_at IS NULL
+	res, err := db.Exec(`UPDATE tickets SET checked_in_at=strftime('%Y-%m-%dT%H:%M:%SZ','now'), checked_in_by=?, listing_price_cents=0
+		WHERE code=? AND checked_in_at IS NULL AND resold=0
 		AND seat_id IN (SELECT id FROM seats WHERE event_id=?)
 		AND order_id IN (SELECT id FROM orders WHERE status='paid')`, door, code, e.ID)
 	if err != nil {
@@ -1302,6 +1478,11 @@ func handleCheckinScan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if n, _ := res.RowsAffected(); n == 1 {
+		// a door scan ends a listing — and any buyer's hold on that seat
+		db.Exec(`UPDATE seats SET status='sold', hold_session=NULL
+			WHERE status='held' AND id=(SELECT seat_id FROM tickets WHERE code=?)`, code)
+		db.Exec(`UPDATE waitlist SET status='expired' WHERE status='offered'
+			AND offered_seat_id=(SELECT seat_id FROM tickets WHERE code=?)`, code)
 		ok, err := checkinResultFor(code)
 		if err != nil {
 			httpErr(w, err)
@@ -1311,19 +1492,35 @@ func handleCheckinScan(w http.ResponseWriter, r *http.Request) {
 		checkinRespond(w, r, http.StatusOK, ok)
 		return
 	}
+	// Status codes are real in both modes: 200 first scan, 409 rescan, 410 void,
+	// 422 wrong event, 404 unknown ticket/door code, 400 empty field.
 	// 0 rows — classify in a fixed order so overlapping states (e.g. a ticket
 	// checked in then refunded) get one deterministic answer
 	var evID, number int64
 	var status, checkedAt, section, row, holder string
-	err = db.QueryRow(`SELECT s.event_id, o.status, COALESCE(t.checked_in_at,''), s.section, s.row, s.number, o.name
+	var resold int64
+	err = db.QueryRow(`SELECT s.event_id, o.status, COALESCE(t.checked_in_at,''), s.section, s.row, s.number,
+		COALESCE(NULLIF(t.holder_name,''),o.name), t.resold
 		FROM tickets t JOIN seats s ON s.id=t.seat_id JOIN orders o ON o.id=t.order_id
 		WHERE t.code=?`, code).
-		Scan(&evID, &status, &checkedAt, &section, &row, &number, &holder)
+		Scan(&evID, &status, &checkedAt, &section, &row, &number, &holder, &resold)
+	if errors.Is(err, sql.ErrNoRows) {
+		var h string
+		herr := db.QueryRow(`SELECT holder_name FROM transfers WHERE old_code=?`, code).Scan(&h)
+		if herr == nil {
+			checkinRespond(w, r, http.StatusGone, CheckinResult{Code: code, Result: "transferred", Holder: h,
+				Msg: "That ticket was transferred to " + h + ". It is no longer valid."})
+			return
+		}
+	}
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
 		checkinRespond(w, r, http.StatusNotFound, CheckinResult{Code: code, Msg: "Unknown ticket code."})
 	case err != nil:
 		httpErr(w, err)
+	case resold == 1:
+		checkinRespond(w, r, http.StatusGone, CheckinResult{Code: code, Result: "resold", Holder: holder,
+			Msg: "That ticket was sold on resale. It is no longer valid."})
 	case evID != e.ID:
 		checkinRespond(w, r, http.StatusUnprocessableEntity, CheckinResult{Code: code, Msg: "That ticket is for a different event."})
 	case status != "paid":
@@ -1372,20 +1569,24 @@ type reportFilters struct {
 }
 
 type ReportRow struct {
-	EventID       int64
-	Artist        string
-	Title         string
-	StartsAt      string
-	Sold          int64
-	Held          int64
-	Refunded      int64
-	PromoOrders   int64
-	GrossCents    int64
-	DiscountCents int64
-	NetCents      int64
-	CheckedIn     int64
-	SoldAllTime   int64
-	CheckinCode   string
+	EventID           int64
+	Artist            string
+	Title             string
+	StartsAt          string
+	Sold              int64
+	Held              int64
+	Refunded          int64
+	PromoOrders       int64
+	GrossCents        int64
+	DiscountCents     int64
+	NetCents          int64
+	CheckedIn         int64
+	SoldAllTime       int64
+	CheckinCode       string
+	Transfers         int64
+	ResaleCount       int64
+	ResaleVolumeCents int64
+	ResaleFeesCents   int64
 }
 
 type reportView struct {
@@ -1462,22 +1663,29 @@ func buildReport(f reportFilters) (reportView, error) {
 			SELECT
 			  (SELECT COUNT(*) FROM seats WHERE event_id=? AND status='held'),
 			  (SELECT COUNT(*) FROM tickets t JOIN orders o ON o.id=t.order_id JOIN seats s ON s.id=t.seat_id
-			    WHERE s.event_id=? AND o.status='paid' AND o.created_at>=? AND o.created_at<=?),
+			    WHERE s.event_id=? AND o.status='paid' AND t.kind<>'resale' AND o.created_at>=? AND o.created_at<=?),
 			  COALESCE((SELECT SUM(t.price_cents) FROM tickets t JOIN orders o ON o.id=t.order_id JOIN seats s ON s.id=t.seat_id
-			    WHERE s.event_id=? AND o.status='paid' AND o.created_at>=? AND o.created_at<=?),0),
+			    WHERE s.event_id=? AND o.status='paid' AND t.kind<>'resale' AND o.created_at>=? AND o.created_at<=?),0),
 			  COALESCE((SELECT ROUND(SUM(t.price_cents * CAST(o.discount_cents+o.group_discount_cents AS REAL)/NULLIF(o.total_cents+o.discount_cents+o.group_discount_cents,0)))
 			    FROM tickets t JOIN orders o ON o.id=t.order_id JOIN seats s ON s.id=t.seat_id
-			    WHERE s.event_id=? AND o.status='paid' AND o.created_at>=? AND o.created_at<=?),0),
+			    WHERE s.event_id=? AND o.status='paid' AND t.kind<>'resale' AND o.created_at>=? AND o.created_at<=?),0),
 			  (SELECT COUNT(*) FROM tickets t JOIN orders o ON o.id=t.order_id JOIN seats s ON s.id=t.seat_id
 			    WHERE s.event_id=? AND o.status='refunded' AND o.refunded_at>=? AND o.refunded_at<=?),
 			  (SELECT COUNT(DISTINCT o.id) FROM orders o JOIN tickets t ON t.order_id=o.id JOIN seats s ON s.id=t.seat_id
 			    WHERE s.event_id=? AND o.promo_code<>'' AND o.status='paid' AND o.created_at>=? AND o.created_at<=?),
 			  (SELECT COUNT(*) FROM tickets t JOIN orders o ON o.id=t.order_id JOIN seats s ON s.id=t.seat_id
-			    WHERE s.event_id=? AND o.status='paid' AND t.checked_in_at IS NOT NULL),
+			    WHERE s.event_id=? AND o.status='paid' AND t.resold=0 AND t.checked_in_at IS NOT NULL),
 			  (SELECT COUNT(*) FROM tickets t JOIN orders o ON o.id=t.order_id JOIN seats s ON s.id=t.seat_id
-			    WHERE s.event_id=? AND o.status='paid')`,
-			e.ID, e.ID, lo, hi, e.ID, lo, hi, e.ID, lo, hi, e.ID, lo, hi, e.ID, lo, hi, e.ID, e.ID).
-			Scan(&row.Held, &row.Sold, &row.GrossCents, &row.DiscountCents, &row.Refunded, &row.PromoOrders, &row.CheckedIn, &row.SoldAllTime)
+			    WHERE s.event_id=? AND o.status='paid' AND t.kind<>'resale'),
+			  (SELECT COUNT(*) FROM transfers tr JOIN tickets t ON t.id=tr.ticket_id JOIN seats s ON s.id=t.seat_id
+			    WHERE s.event_id=? AND tr.created_at>=? AND tr.created_at<=?),
+			  (SELECT COUNT(*) FROM resales rs WHERE rs.event_id=? AND rs.created_at>=? AND rs.created_at<=?),
+			  COALESCE((SELECT SUM(rs.price_cents) FROM resales rs WHERE rs.event_id=? AND rs.created_at>=? AND rs.created_at<=?),0),
+			  COALESCE((SELECT SUM(rs.fee_cents) FROM resales rs WHERE rs.event_id=? AND rs.created_at>=? AND rs.created_at<=?),0)`,
+			e.ID, e.ID, lo, hi, e.ID, lo, hi, e.ID, lo, hi, e.ID, lo, hi, e.ID, lo, hi, e.ID, e.ID,
+			e.ID, lo, hi, e.ID, lo, hi, e.ID, lo, hi, e.ID, lo, hi).
+			Scan(&row.Held, &row.Sold, &row.GrossCents, &row.DiscountCents, &row.Refunded, &row.PromoOrders,
+				&row.CheckedIn, &row.SoldAllTime, &row.Transfers, &row.ResaleCount, &row.ResaleVolumeCents, &row.ResaleFeesCents)
 		if err != nil {
 			return reportView{}, err
 		}
@@ -1494,6 +1702,10 @@ func buildReport(f reportFilters) (reportView, error) {
 		t.NetCents += row.NetCents
 		t.CheckedIn += row.CheckedIn
 		t.SoldAllTime += row.SoldAllTime
+		t.Transfers += row.Transfers
+		t.ResaleCount += row.ResaleCount
+		t.ResaleVolumeCents += row.ResaleVolumeCents
+		t.ResaleFeesCents += row.ResaleFeesCents
 	}
 	q := make(url.Values)
 	if f.EventID != 0 {
@@ -1536,7 +1748,7 @@ func handleAdminCSV(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
 	w.Header().Set("Content-Disposition", `attachment; filename="sales-report.csv"`)
 	cw := csv.NewWriter(w)
-	cw.Write([]string{"event", "starts_at", "tickets_sold", "tickets_checked_in", "seats_held", "tickets_refunded", "promo_orders", "gross", "discounts", "net_revenue"})
+	cw.Write([]string{"event", "starts_at", "tickets_sold", "tickets_checked_in", "seats_held", "tickets_refunded", "promo_orders", "gross", "discounts", "net_revenue", "transfers", "resale_count", "resale_volume", "resale_fees"})
 	moneyStr := func(c int64) string { return fmt.Sprintf("%.2f", float64(c)/100) }
 	for _, row := range v.Rows {
 		cw.Write([]string{
@@ -1550,12 +1762,18 @@ func handleAdminCSV(w http.ResponseWriter, r *http.Request) {
 			moneyStr(row.GrossCents),
 			moneyStr(row.DiscountCents),
 			moneyStr(row.NetCents),
+			strconv.FormatInt(row.Transfers, 10),
+			strconv.FormatInt(row.ResaleCount, 10),
+			moneyStr(row.ResaleVolumeCents),
+			moneyStr(row.ResaleFeesCents),
 		})
 	}
 	t := v.Total
 	cw.Write([]string{"TOTAL", "", strconv.FormatInt(t.Sold, 10), strconv.FormatInt(t.CheckedIn, 10), strconv.FormatInt(t.Held, 10),
 		strconv.FormatInt(t.Refunded, 10), strconv.FormatInt(t.PromoOrders, 10),
-		moneyStr(t.GrossCents), moneyStr(t.DiscountCents), moneyStr(t.NetCents)})
+		moneyStr(t.GrossCents), moneyStr(t.DiscountCents), moneyStr(t.NetCents),
+		strconv.FormatInt(t.Transfers, 10), strconv.FormatInt(t.ResaleCount, 10),
+		moneyStr(t.ResaleVolumeCents), moneyStr(t.ResaleFeesCents)})
 	cw.Flush()
 }
 
@@ -1576,7 +1794,11 @@ func offerSeat(tx *sql.Tx, seatID, eventID int64) error {
 		err := tx.QueryRow(`SELECT id, session_id FROM waitlist
 			WHERE event_id=? AND status='waiting' ORDER BY id LIMIT 1`, eventID).Scan(&wID, &wsid)
 		if errors.Is(err, sql.ErrNoRows) {
-			_, err := tx.Exec(`UPDATE seats SET status='available', hold_session=NULL WHERE id=?`, seatID)
+			// a listed seat goes back on the resale map, not to the pool
+			_, err := tx.Exec(`UPDATE seats SET status=(CASE WHEN EXISTS(
+				SELECT 1 FROM tickets t JOIN orders o ON o.id=t.order_id
+				WHERE t.seat_id=seats.id AND t.resold=0 AND o.status='paid' AND t.listing_price_cents>0
+			) THEN 'sold' ELSE 'available' END), hold_session=NULL WHERE id=?`, seatID)
 			return err
 		}
 		if err != nil {
@@ -1698,6 +1920,8 @@ func getWaitlistView(eventID int64, sid string) (*WaitlistView, error) {
 		if err := db.QueryRow(`SELECT section||' · '||row||number FROM seats WHERE id=?`, seatID.Int64).Scan(&v.SeatLabel); err != nil {
 			return nil, err
 		}
+		db.QueryRow(`SELECT t.listing_price_cents FROM tickets t JOIN orders o ON o.id=t.order_id
+			WHERE t.seat_id=? AND t.resold=0 AND o.status='paid' AND t.listing_price_cents>0`, seatID.Int64).Scan(&v.ResaleCents)
 		if t, err := time.Parse(time.RFC3339, expires.String); err == nil {
 			v.MinutesLeft = int64(math.Ceil(time.Until(t).Minutes()))
 		}
@@ -1713,8 +1937,8 @@ func getEvent(id int64) (Event, error) {
 }
 
 func getSections(eventID int64, sid string) ([]SeatSection, error) {
-	rows, err := db.Query(`SELECT id,event_id,section,row,number,price_cents,status,COALESCE(hold_session,''),tier
-		FROM seats WHERE event_id=? ORDER BY stage_rank, row, number`, eventID)
+	rows, err := db.Query(`SELECT id,event_id,section,row,number,price_cents,status,COALESCE(hold_session,''),tier, COALESCE((SELECT t2.listing_price_cents FROM tickets t2 JOIN orders o2 ON o2.id=t2.order_id WHERE t2.seat_id=s.id AND t2.resold=0 AND o2.status='paid' AND t2.listing_price_cents>0),0)
+		FROM seats s WHERE event_id=? ORDER BY stage_rank, row, number`, eventID)
 	if err != nil {
 		return nil, err
 	}
@@ -1726,7 +1950,7 @@ func getSections(eventID int64, sid string) ([]SeatSection, error) {
 	rowIdx := map[string]int{}    // "section|row" -> index in section.Rows
 	for rows.Next() {
 		var s Seat
-		if err := rows.Scan(&s.ID, &s.EventID, &s.Section, &s.Row, &s.Number, &s.PriceCents, &s.Status, &s.HoldSession, &s.Tier); err != nil {
+		if err := rows.Scan(&s.ID, &s.EventID, &s.Section, &s.Row, &s.Number, &s.PriceCents, &s.Status, &s.HoldSession, &s.Tier, &s.ResaleCents); err != nil {
 			return nil, err
 		}
 		s.Viewer = sid
@@ -1753,8 +1977,8 @@ func getSections(eventID int64, sid string) ([]SeatSection, error) {
 }
 
 func getCart(eventID int64, sid string) (CartView, error) {
-	rows, err := db.Query(`SELECT id,event_id,section,row,number,price_cents,status,COALESCE(hold_session,''),tier
-		FROM seats WHERE event_id=? AND status='held' AND hold_session=? ORDER BY stage_rank,row,number`, eventID, sid)
+	rows, err := db.Query(`SELECT id,event_id,section,row,number,price_cents,status,COALESCE(hold_session,''),tier, COALESCE((SELECT t2.listing_price_cents FROM tickets t2 JOIN orders o2 ON o2.id=t2.order_id WHERE t2.seat_id=s.id AND t2.resold=0 AND o2.status='paid' AND t2.listing_price_cents>0),0)
+		FROM seats s WHERE event_id=? AND status='held' AND hold_session=? ORDER BY stage_rank,row,number`, eventID, sid)
 	if err != nil {
 		return CartView{}, err
 	}
@@ -1762,16 +1986,25 @@ func getCart(eventID int64, sid string) (CartView, error) {
 	cart := CartView{EventID: eventID, Max: maxTicketsPerEvent}
 	for rows.Next() {
 		var s Seat
-		if err := rows.Scan(&s.ID, &s.EventID, &s.Section, &s.Row, &s.Number, &s.PriceCents, &s.Status, &s.HoldSession, &s.Tier); err != nil {
+		if err := rows.Scan(&s.ID, &s.EventID, &s.Section, &s.Row, &s.Number, &s.PriceCents, &s.Status, &s.HoldSession, &s.Tier, &s.ResaleCents); err != nil {
 			return CartView{}, err
 		}
 		cart.Seats = append(cart.Seats, s)
-		cart.TotalCents += s.PriceCents
+		cart.TotalCents += s.CartCents()
+		if s.ResaleCents > 0 {
+			cart.HasResale = true
+		}
 	}
 	if rows.Err() != nil {
 		return CartView{}, rows.Err()
 	}
-	cart.DealCents = groupDiscount(cart.Seats)
+	var normal []Seat
+	for _, s := range cart.Seats {
+		if s.ResaleCents == 0 {
+			normal = append(normal, s)
+		}
+	}
+	cart.DealCents = groupDiscount(normal)
 	cart.TotalCents -= cart.DealCents
 	owned, _, err := ticketUsage(eventID, sid)
 	if err != nil {
@@ -1846,7 +2079,7 @@ func ticketUsage(eventID int64, sid string) (owned, held int64, err error) {
 // heldSeats returns all seats this session holds, across events.
 func heldSeats(sid string) ([]Seat, error) {
 	rows, err := db.Query(`SELECT s.id,s.event_id,s.section,s.row,s.number,s.price_cents,s.status,COALESCE(s.hold_session,''),s.tier,
-		       e.artist || ' — ' || e.title
+		       e.artist || ' — ' || e.title, COALESCE((SELECT t2.listing_price_cents FROM tickets t2 JOIN orders o2 ON o2.id=t2.order_id WHERE t2.seat_id=s.id AND t2.resold=0 AND o2.status='paid' AND t2.listing_price_cents>0),0)
 		FROM seats s JOIN events e ON e.id = s.event_id
 		WHERE s.status='held' AND s.hold_session=? ORDER BY s.event_id,s.stage_rank,s.row,s.number`, sid)
 	if err != nil {
@@ -1856,7 +2089,7 @@ func heldSeats(sid string) ([]Seat, error) {
 	var out []Seat
 	for rows.Next() {
 		var s Seat
-		if err := rows.Scan(&s.ID, &s.EventID, &s.Section, &s.Row, &s.Number, &s.PriceCents, &s.Status, &s.HoldSession, &s.Tier, &s.EventName); err != nil {
+		if err := rows.Scan(&s.ID, &s.EventID, &s.Section, &s.Row, &s.Number, &s.PriceCents, &s.Status, &s.HoldSession, &s.Tier, &s.EventName, &s.ResaleCents); err != nil {
 			return nil, err
 		}
 		s.Viewer = sid
@@ -1909,4 +2142,423 @@ func qrSVG(code string) template.HTML {
 
 func httpErr(w http.ResponseWriter, err error) {
 	http.Error(w, "internal error: "+err.Error(), http.StatusInternalServerError)
+}
+
+// ---------- tickets: page, transfer, resale listing ----------
+//
+// The code is the credential: whoever holds the current code of a ticket is
+// its holder, the same way a door code is the door's credential. A transfer
+// retires the old code into the transfers table and mints a new one; a resale
+// leaves the code dead on the ticket row with resold=1.
+
+// ticketState is one ticket as the page and JSON view see it.
+type ticketState struct {
+	ID          int64
+	Code        string
+	OrderID     int64
+	SeatID      int64
+	EventID     int64
+	Section     string
+	Row         string
+	Number      int64
+	Tier        string
+	FaceCents   int64
+	HolderName  string
+	HolderEmail string
+	OrderStatus string
+	CheckedInAt string
+	ListedCents int64
+	Resold      bool
+	ResaleCents int64
+	Transfers   int64
+	Artist      string
+	Title       string
+	Venue       string
+	City        string
+	StartsAt    string
+}
+
+// ticketForCode loads a live ticket row by its (normalized) code.
+func ticketForCode(code string) (ticketState, error) {
+	var t ticketState
+	err := db.QueryRow(`SELECT t.id, t.code, t.order_id, t.seat_id, s.event_id,
+		s.section, s.row, s.number, s.tier, t.price_cents,
+		COALESCE(NULLIF(t.holder_name,''),o.name), COALESCE(NULLIF(t.holder_email,''),o.email),
+		o.status, COALESCE(t.checked_in_at,''), t.listing_price_cents, t.resold, t.resale_price_cents,
+		(SELECT COUNT(*) FROM transfers tr WHERE tr.ticket_id=t.id),
+		e.artist, e.title, e.venue, e.city, e.starts_at
+		FROM tickets t
+		JOIN seats s ON s.id=t.seat_id
+		JOIN orders o ON o.id=t.order_id
+		JOIN events e ON e.id=s.event_id
+		WHERE t.code=?`, code).
+		Scan(&t.ID, &t.Code, &t.OrderID, &t.SeatID, &t.EventID, &t.Section, &t.Row, &t.Number, &t.Tier,
+			&t.FaceCents, &t.HolderName, &t.HolderEmail, &t.OrderStatus, &t.CheckedInAt,
+			&t.ListedCents, &t.Resold, &t.ResaleCents, &t.Transfers,
+			&t.Artist, &t.Title, &t.Venue, &t.City, &t.StartsAt)
+	return t, err
+}
+
+// transferToName resolves a dead code to the holder it was transferred to.
+func transferToName(code string) (string, bool) {
+	var name string
+	err := db.QueryRow(`SELECT holder_name FROM transfers WHERE old_code=?`, code).Scan(&name)
+	return name, err == nil
+}
+
+type holderView struct {
+	Name  string `json:"name"`
+	Email string `json:"email"`
+}
+
+// holderChain is the buyer first, then every holder the ticket was
+// transferred to, oldest first — the last entry is the current holder.
+func holderChain(t ticketState) ([]holderView, error) {
+	var buyer holderView
+	if err := db.QueryRow(`SELECT name, email FROM orders WHERE id=?`, t.OrderID).Scan(&buyer.Name, &buyer.Email); err != nil {
+		return nil, err
+	}
+	chain := []holderView{buyer}
+	rows, err := db.Query(`SELECT holder_name, holder_email FROM transfers WHERE ticket_id=? ORDER BY id`, t.ID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var h holderView
+		if err := rows.Scan(&h.Name, &h.Email); err != nil {
+			return nil, err
+		}
+		chain = append(chain, h)
+	}
+	return chain, rows.Err()
+}
+
+func wantsJSON(r *http.Request) bool {
+	return strings.Contains(r.Header.Get("Accept"), "application/json")
+}
+
+// ticketJSON is the wire shape for GET /tickets/{code} and the refusals.
+type ticketJSON struct {
+	Code              string       `json:"code"`
+	Status            string       `json:"status"`
+	HolderName        string       `json:"holder_name"`
+	HolderEmail       string       `json:"holder_email"`
+	EventID           int64        `json:"event_id"`
+	Section           string       `json:"section"`
+	Row               string       `json:"row"`
+	Number            int64        `json:"number"`
+	FaceValueCents    int64        `json:"face_value_cents"`
+	Transfers         int64        `json:"transfers"`
+	Holders           []holderView `json:"holders"`
+	CheckedInAt       string       `json:"checked_in_at"`
+	ListingPriceCents int64        `json:"listing_price_cents"`
+	ResalePriceCents  int64        `json:"resale_price_cents,omitempty"`
+	FeeCents          int64        `json:"fee_cents,omitempty"`
+	PayoutCents       int64        `json:"payout_cents,omitempty"`
+	Message           string       `json:"message"`
+}
+
+func writeJSON(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(v)
+}
+
+// ticketRefuse answers an action refusal in the requester's format: plain
+// text for browsers, a JSON object carrying the same sentence for scanners.
+func ticketRefuse(w http.ResponseWriter, r *http.Request, status int, msg string) {
+	if wantsJSON(r) {
+		writeJSON(w, status, map[string]any{"code": r.PathValue("code"), "message": msg})
+		return
+	}
+	http.Error(w, msg, status)
+}
+
+func ticketRedirect(w http.ResponseWriter, r *http.Request, code string) {
+	url := "/tickets/" + code
+	if r.Header.Get("HX-Request") == "true" {
+		w.Header().Set("HX-Redirect", url)
+		return
+	}
+	http.Redirect(w, r, url, http.StatusSeeOther)
+}
+
+// resolveTicket maps a request code to a live ticket, a transferred dead code,
+// or nothing. The second return is the holder a transferred code went to.
+func resolveTicket(raw string) (ticketState, string, error) {
+	code := normalizeTicketCode(raw)
+	t, err := ticketForCode(code)
+	if err == nil {
+		return t, "", nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return ticketState{}, "", err
+	}
+	if name, ok := transferToName(code); ok {
+		return ticketState{Code: code}, name, nil
+	}
+	return ticketState{}, "", sql.ErrNoRows
+}
+
+func handleTicketPage(w http.ResponseWriter, r *http.Request) {
+	t, transferredTo, err := resolveTicket(r.PathValue("code"))
+	if errors.Is(err, sql.ErrNoRows) {
+		if wantsJSON(r) {
+			writeJSON(w, http.StatusNotFound, ticketJSON{Code: normalizeTicketCode(r.PathValue("code")), Status: "not_found", Message: "Unknown ticket code."})
+			return
+		}
+		http.Error(w, "Unknown ticket code.", http.StatusNotFound)
+		return
+	}
+	if err != nil {
+		httpErr(w, err)
+		return
+	}
+	if transferredTo != "" {
+		msg := "This ticket was transferred to " + transferredTo + "."
+		if wantsJSON(r) {
+			writeJSON(w, http.StatusGone, ticketJSON{Code: t.Code, Status: "transferred", HolderName: transferredTo, Message: msg})
+			return
+		}
+		http.Error(w, msg, http.StatusGone)
+		return
+	}
+	if t.Resold {
+		fee := (t.ResaleCents*5 + 50) / 100
+		if wantsJSON(r) {
+			writeJSON(w, http.StatusGone, ticketJSON{Code: t.Code, Status: "resold",
+				ResalePriceCents: t.ResaleCents, FeeCents: fee, PayoutCents: t.ResaleCents - fee,
+				Message: "This ticket was sold on resale."})
+			return
+		}
+		http.Error(w, "This ticket was sold on resale.", http.StatusGone)
+		return
+	}
+	if t.OrderStatus != "paid" {
+		if wantsJSON(r) {
+			writeJSON(w, http.StatusGone, ticketJSON{Code: t.Code, Status: "refunded", Message: "This ticket was refunded."})
+			return
+		}
+		http.Error(w, "This ticket was refunded.", http.StatusGone)
+		return
+	}
+	chain, err := holderChain(t)
+	if err != nil {
+		httpErr(w, err)
+		return
+	}
+	status := "active"
+	if t.ListedCents > 0 {
+		status = "listed"
+	}
+	if wantsJSON(r) {
+		writeJSON(w, http.StatusOK, ticketJSON{Code: t.Code, Status: status,
+			HolderName: t.HolderName, HolderEmail: t.HolderEmail, EventID: t.EventID,
+			Section: t.Section, Row: t.Row, Number: t.Number, FaceValueCents: t.FaceCents,
+			Transfers: t.Transfers, Holders: chain, CheckedInAt: t.CheckedInAt,
+			ListingPriceCents: t.ListedCents})
+		return
+	}
+	// HTML: forms when the holder can act, the matching sentence when not.
+	var transferNote, listNote string
+	switch {
+	case t.CheckedInAt != "":
+		transferNote = "This ticket has already been checked in and cannot be transferred."
+		listNote = "This ticket has already been checked in and cannot be listed."
+	case t.Transfers >= 3:
+		transferNote = "This ticket has reached the limit of 3 transfers."
+	}
+	render(w, "ticket.html", struct {
+		T            ticketState
+		Holders      []holderView
+		Listed       bool
+		CanTransfer  bool
+		CanList      bool
+		TransferNote string
+		ListNote     string
+	}{t, chain, t.ListedCents > 0, transferNote == "" && t.ListedCents == 0, listNote == "" && t.ListedCents == 0, transferNote, listNote})
+}
+
+func handleTicketTransfer(w http.ResponseWriter, r *http.Request) {
+	t, transferredTo, err := resolveTicket(r.PathValue("code"))
+	if errors.Is(err, sql.ErrNoRows) {
+		ticketRefuse(w, r, http.StatusNotFound, "Unknown ticket code.")
+		return
+	}
+	if err != nil {
+		httpErr(w, err)
+		return
+	}
+	switch {
+	case transferredTo != "":
+		ticketRefuse(w, r, http.StatusGone, "This ticket was transferred to "+transferredTo+".")
+		return
+	case t.Resold:
+		ticketRefuse(w, r, http.StatusGone, "This ticket was sold on resale.")
+		return
+	case t.OrderStatus != "paid":
+		ticketRefuse(w, r, http.StatusGone, "This ticket was refunded and cannot be transferred.")
+		return
+	case t.CheckedInAt != "":
+		ticketRefuse(w, r, http.StatusConflict, "This ticket has already been checked in and cannot be transferred.")
+		return
+	case t.ListedCents > 0:
+		ticketRefuse(w, r, http.StatusConflict, "This ticket is listed for resale. Delist it before transferring.")
+		return
+	case t.Transfers >= 3:
+		ticketRefuse(w, r, http.StatusConflict, "This ticket has reached the limit of 3 transfers.")
+		return
+	}
+	name := strings.TrimSpace(r.FormValue("name"))
+	email := strings.TrimSpace(r.FormValue("email"))
+	if name == "" || !strings.Contains(email, "@") {
+		ticketRefuse(w, r, http.StatusUnprocessableEntity, "Enter a name and a valid email address for the new holder.")
+		return
+	}
+	if strings.EqualFold(email, t.HolderEmail) {
+		ticketRefuse(w, r, http.StatusUnprocessableEntity, "This ticket already belongs to that email address.")
+		return
+	}
+	newCode := "TP-" + strings.ToUpper(newID(5))
+	tx, err := db.Begin()
+	if err != nil {
+		httpErr(w, err)
+		return
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`INSERT INTO transfers (ticket_id,old_code,new_code,holder_name,holder_email,created_at)
+		VALUES (?,?,?,?,?,strftime('%Y-%m-%dT%H:%M:%SZ','now'))`, t.ID, t.Code, newCode, name, email); err != nil {
+		httpErr(w, err)
+		return
+	}
+	if _, err := tx.Exec(`UPDATE tickets SET code=?, holder_name=?, holder_email=? WHERE id=?`, newCode, name, email, t.ID); err != nil {
+		httpErr(w, err)
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		httpErr(w, err)
+		return
+	}
+	ticketRedirect(w, r, newCode)
+}
+
+var dollarsRx = regexp.MustCompile(`^(\d+)(?:\.(\d{1,2}))?$`)
+
+// parseDollars turns "130", "130.5" or "130.00" into cents.
+func parseDollars(s string) (int64, bool) {
+	m := dollarsRx.FindStringSubmatch(strings.TrimSpace(s))
+	if m == nil {
+		return 0, false
+	}
+	whole, _ := strconv.ParseInt(m[1], 10, 64)
+	cents := whole * 100
+	if m[2] != "" {
+		frac, _ := strconv.ParseInt(m[2]+"0"[:2-len(m[2])], 10, 64)
+		cents += frac
+	}
+	return cents, cents > 0
+}
+
+func handleTicketList(w http.ResponseWriter, r *http.Request) {
+	t, transferredTo, err := resolveTicket(r.PathValue("code"))
+	if errors.Is(err, sql.ErrNoRows) {
+		ticketRefuse(w, r, http.StatusNotFound, "Unknown ticket code.")
+		return
+	}
+	if err != nil {
+		httpErr(w, err)
+		return
+	}
+	switch {
+	case transferredTo != "":
+		ticketRefuse(w, r, http.StatusGone, "This ticket was transferred to "+transferredTo+".")
+		return
+	case t.Resold:
+		ticketRefuse(w, r, http.StatusGone, "This ticket was sold on resale.")
+		return
+	case t.OrderStatus != "paid":
+		ticketRefuse(w, r, http.StatusGone, "This ticket was refunded and cannot be listed.")
+		return
+	case t.CheckedInAt != "":
+		ticketRefuse(w, r, http.StatusConflict, "This ticket has already been checked in and cannot be listed.")
+		return
+	case t.ListedCents > 0:
+		ticketRefuse(w, r, http.StatusConflict, "This ticket is already listed for resale.")
+		return
+	}
+	price, ok := parseDollars(r.FormValue("price"))
+	if !ok {
+		ticketRefuse(w, r, http.StatusUnprocessableEntity, "Enter a resale price in dollars, like 120.00.")
+		return
+	}
+	cap := t.FaceCents * 110 / 100
+	if price > cap {
+		ticketRefuse(w, r, http.StatusUnprocessableEntity, fmt.Sprintf("Resale price cannot be more than $%.2f, which is 110%% of the $%.2f face value.", float64(cap)/100, float64(t.FaceCents)/100))
+		return
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		httpErr(w, err)
+		return
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`UPDATE tickets SET listing_price_cents=? WHERE id=?`, price, t.ID); err != nil {
+		httpErr(w, err)
+		return
+	}
+	// on a sold out event the listing is offered to the waitlist first
+	soldOut, err := eventSoldOut(t.EventID)
+	if err == nil && soldOut {
+		err = offerSeat(tx, t.SeatID, t.EventID)
+	}
+	if err != nil {
+		httpErr(w, err)
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		httpErr(w, err)
+		return
+	}
+	ticketRedirect(w, r, t.Code)
+}
+
+func handleTicketDelist(w http.ResponseWriter, r *http.Request) {
+	t, transferredTo, err := resolveTicket(r.PathValue("code"))
+	if errors.Is(err, sql.ErrNoRows) {
+		ticketRefuse(w, r, http.StatusNotFound, "Unknown ticket code.")
+		return
+	}
+	if err != nil {
+		httpErr(w, err)
+		return
+	}
+	switch {
+	case transferredTo != "":
+		ticketRefuse(w, r, http.StatusGone, "This ticket was transferred to "+transferredTo+".")
+		return
+	case t.Resold:
+		ticketRefuse(w, r, http.StatusGone, "This ticket was sold on resale.")
+		return
+	case t.OrderStatus != "paid":
+		ticketRefuse(w, r, http.StatusGone, "This ticket was refunded and cannot be delisted.")
+		return
+	case t.ListedCents == 0:
+		ticketRefuse(w, r, http.StatusConflict, "This ticket is not listed for resale.")
+		return
+	}
+	var heldBy int64
+	if err := db.QueryRow(`SELECT COUNT(*) FROM seats WHERE id=? AND status='held'`, t.SeatID).Scan(&heldBy); err != nil {
+		httpErr(w, err)
+		return
+	}
+	if heldBy > 0 {
+		ticketRefuse(w, r, http.StatusConflict, "This ticket is in a buyer's cart and cannot be delisted right now.")
+		return
+	}
+	if _, err := db.Exec(`UPDATE tickets SET listing_price_cents=0 WHERE id=?`, t.ID); err != nil {
+		httpErr(w, err)
+		return
+	}
+	ticketRedirect(w, r, t.Code)
 }

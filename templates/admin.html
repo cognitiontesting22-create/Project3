@@ -95,6 +95,10 @@
           <th class="px-4 py-3 text-right font-semibold">Gross</th>
           <th class="px-4 py-3 text-right font-semibold">Discounts</th>
           <th class="px-5 py-3 text-right font-semibold">Net</th>
+          <th class="px-4 py-3 text-right font-semibold">Transfers</th>
+          <th class="px-4 py-3 text-right font-semibold">Resales</th>
+          <th class="px-4 py-3 text-right font-semibold">Resale volume</th>
+          <th class="px-5 py-3 text-right font-semibold">Resale fees</th>
         </tr>
       </thead>
       <tbody class="divide-y divide-white/5">
@@ -119,6 +123,10 @@
           <td class="px-4 py-3.5 text-right text-zinc-400">{{money .GrossCents}}</td>
           <td class="px-4 py-3.5 text-right text-zinc-400">{{if .DiscountCents}}−{{money .DiscountCents}}{{else}}—{{end}}</td>
           <td class="px-5 py-3.5 text-right font-bold text-emerald-400">{{money .NetCents}}</td>
+          <td class="px-4 py-3.5 text-right text-zinc-300">{{.Transfers}}</td>
+          <td class="px-4 py-3.5 text-right text-zinc-300">{{.ResaleCount}}</td>
+          <td class="px-4 py-3.5 text-right text-teal-300">{{money .ResaleVolumeCents}}</td>
+          <td class="px-5 py-3.5 text-right text-teal-300">{{money .ResaleFeesCents}}</td>
         </tr>
         {{end}}
       </tbody>
@@ -133,6 +141,10 @@
           <td class="px-4 py-3.5 text-right">{{money .Total.GrossCents}}</td>
           <td class="px-4 py-3.5 text-right">−{{money .Total.DiscountCents}}</td>
           <td class="px-5 py-3.5 text-right text-emerald-400">{{money .Total.NetCents}}</td>
+          <td class="px-4 py-3.5 text-right">{{.Total.Transfers}}</td>
+          <td class="px-4 py-3.5 text-right">{{.Total.ResaleCount}}</td>
+          <td class="px-4 py-3.5 text-right">{{money .Total.ResaleVolumeCents}}</td>
+          <td class="px-5 py-3.5 text-right">{{money .Total.ResaleFeesCents}}</td>
         </tr>
       </tfoot>
     </table>
