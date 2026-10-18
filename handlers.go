@@ -1021,7 +1021,7 @@ func handleOrder(w http.ResponseWriter, r *http.Request) {
 		}
 		t.Transferred = t.Transfers > 0
 		t.TransferredTo = t.HolderName
-		t.CanTransfer = o.Status == "paid" && t.CheckedInAt == "" && !t.Transferred && !t.Resold && t.ListingCents == 0
+		t.CanTransfer = o.Status == "paid" && t.CheckedInAt == "" && !t.Transferred && !t.Resold && t.ListingCents == 0 && t.Transfers < 3
 		t.PayoutCents = t.ResalePriceCents - (t.ResalePriceCents*5+50)/100
 		if t.Transferred || t.Resold || t.ListingCents > 0 || t.Kind == "resale" {
 			refundable = false

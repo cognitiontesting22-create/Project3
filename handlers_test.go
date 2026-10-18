@@ -1190,3 +1190,73 @@ func TestRefundRefusals(t *testing.T) {
 		t.Fatal("refusal changed the order")
 	}
 }
+
+func orderPageBody(t *testing.T, oid int64, sid string) string {
+	t.Helper()
+	return do(t, "GET /orders/{id}", handleOrder, "GET", fmt.Sprintf("/orders/%d", oid), sid, nil).Body.String()
+}
+
+func TestOrderPageAfterTransfer(t *testing.T) {
+	setup(t)
+	oid, code := buyTicket(t, "s1")
+	body := orderPageBody(t, oid, "s1")
+	if !strings.Contains(body, code) || !strings.Contains(body, "Transfer") {
+		t.Fatal("live ticket should show its code and a transfer form")
+	}
+	rec := transferReq(t, code, "Dana Lee", "dana@example.com")
+	newCode := rec.Header().Get("HX-Redirect")[len("/tickets/"):]
+	body = orderPageBody(t, oid, "s1")
+	if strings.Contains(body, newCode) {
+		t.Fatal("new code must never reach the original buyer's order page")
+	}
+	if strings.Contains(body, code) {
+		t.Fatal("transferred ticket should show no code")
+	}
+	if !strings.Contains(body, "Transferred to Dana Lee") {
+		t.Fatalf("missing transferred text: %q", body)
+	}
+}
+
+func TestOrderPageResalePayout(t *testing.T) {
+	setup(t)
+	oid, code := buyTicket(t, "s1")
+	seatID := queryInt(t, `SELECT seat_id FROM tickets WHERE code=?`, code)
+	listReq(t, code, "130.00")
+	do(t, "POST /events/{id}/seats/{seatID}/toggle", handleToggleSeat, "POST", fmt.Sprintf("/events/1/seats/%d/toggle", seatID), "s2", nil)
+	rec := do(t, "POST /checkout", handleCheckout, "POST", "/checkout", "s2", url.Values{
+		"name": {"B"}, "email": {"b@x.com"}, "card": {"4242424242424242"}})
+	buyerOrder := rec.Header().Get("HX-Redirect")[len("/orders/"):]
+	body := orderPageBody(t, oid, "s1")
+	if !strings.Contains(body, "Sold on resale · Payout $123.50") {
+		t.Fatalf("missing payout text: %q", body)
+	}
+	if strings.Contains(body, code) {
+		t.Fatal("resold ticket should show no code")
+	}
+	// the buyer's order page shows the new code with its QR
+	newCode := queryStr(t, `SELECT code FROM tickets WHERE seat_id=? AND kind='resale'`, seatID)
+	body = orderPageBody(t, queryInt(t, `SELECT id FROM orders ORDER BY id DESC LIMIT 1`), "s2")
+	if !strings.Contains(body, newCode) {
+		t.Fatalf("buyer order page should show the new code, order %s", buyerOrder)
+	}
+}
+
+func TestCheckoutResaleSentence(t *testing.T) {
+	setup(t)
+	sentence := "Promo codes and group deals do not apply to resale seats."
+	// no resale seat in cart — no sentence
+	holdSeat(t, 65, "s2")
+	body := do(t, "GET /checkout", handleCheckoutPage, "GET", "/checkout", "s2", nil).Body.String()
+	if strings.Contains(body, sentence) {
+		t.Fatal("sentence shown without a resale seat")
+	}
+	// add a resale seat — sentence appears
+	_, code := buyTicket(t, "s1")
+	seatID := queryInt(t, `SELECT seat_id FROM tickets WHERE code=?`, code)
+	listReq(t, code, "130.00")
+	do(t, "POST /events/{id}/seats/{seatID}/toggle", handleToggleSeat, "POST", fmt.Sprintf("/events/1/seats/%d/toggle", seatID), "s2", nil)
+	body = do(t, "GET /checkout", handleCheckoutPage, "GET", "/checkout", "s2", nil).Body.String()
+	if !strings.Contains(body, sentence) {
+		t.Fatal("sentence missing with a resale seat in the cart")
+	}
+}
